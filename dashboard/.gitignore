@@ -1,0 +1,21 @@
+node_modules
+.next
+out
+dist
+.DS_Store
+
+# env — never commit
+.env
+.env.local
+.env.*.local
+
+# user setup output (contains real company data)
+../data/company-profile.json
+../data/.drive-config.json
+../data/.drive-state.json
+../data/.backup-state.json
+../data/.chats/
+
+# logs
+npm-debug.log*
+yarn-error.log*
