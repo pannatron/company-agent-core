@@ -1,0 +1,33 @@
+# --- Build artifacts ---
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Env / secrets — never commit ---
+.env
+.env.local
+.env.*.local
+
+# --- Logs ---
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*
+*.log
+
+# --- Org-specific operational data ---
+# Each organization populates these — schemas are documented in agent JDs.
+/data/*
+!/data/.gitkeep
+
+# --- Org-specific output artifacts ---
+# Generated/uploaded by each organization (slips, invoices, reports, chats).
+# SOPs are kept because they're reusable templates.
+/outputs/*
+!/outputs/.gitkeep
+!/outputs/sop-*.md
