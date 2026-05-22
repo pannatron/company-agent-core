@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { EmployeeMeta } from "@/lib/employees";
 import { summarizeAutoSync, useAutoSync } from "@/lib/useAutoSync";
 import Avatar from "./Avatar";
+import MentionTextarea from "./MentionTextarea";
 
 interface Attachment {
   path: string;
@@ -34,11 +35,19 @@ interface UserMessage {
   attachments?: Attachment[];
 }
 
+interface GeneratedFile {
+  path: string;
+  name: string;
+  mimeType: string;
+  size: number;
+}
+
 interface AssistantMessage {
   role: "assistant";
   blocks: AssistantBlock[];
   status: "streaming" | "done" | "error";
   durationMs?: number;
+  generatedFiles?: GeneratedFile[];
 }
 
 type Message = UserMessage | AssistantMessage;
@@ -67,6 +76,10 @@ export default function ChatPane({ employee }: Props) {
   const [outputs, setOutputs] = useState<OutputFile[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   const [confirmingClear, setConfirmingClear] = useState(false);
+  // Pagination — render only the last N messages to keep the DOM small. Old
+  // messages are still in `messages` state (used by send() to pass full
+  // history to the API); we just don't mount their bubbles.
+  const [displayCount, setDisplayCount] = useState(30);
   const autoSync = useAutoSync();
   const endRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -80,6 +93,7 @@ export default function ChatPane({ employee }: Props) {
     setSessionStart(Date.now());
     setOutputs([]);
     setMessages([]);
+    setDisplayCount(10);
 
     let alive = true;
     fetch(`/api/chats/${chatId}`)
@@ -228,6 +242,7 @@ export default function ChatPane({ employee }: Props) {
     setPendingFiles([]);
     setStreaming(true);
 
+    const turnStartAt = Date.now();
     const ac = new AbortController();
     abortRef.current = ac;
 
@@ -297,6 +312,21 @@ export default function ChatPane({ employee }: Props) {
       setStreaming(false);
       abortRef.current = null;
       refreshOutputs();
+      // Attach images created during this turn as inline previews on the last assistant message
+      try {
+        const res = await fetch(
+          `/api/outputs/list?since=${turnStartAt}&includeUploads=0`,
+        );
+        if (res.ok) {
+          const data = (await res.json()) as { files: GeneratedFile[] };
+          const images = data.files.filter((f) => f.mimeType.startsWith("image/"));
+          if (images.length > 0) {
+            updateLastAssistant((m) => ({ ...m, generatedFiles: images }));
+          }
+        }
+      } catch {
+        /* ignore — preview is best-effort */
+      }
       if (autoSync.enabled) {
         const r = await autoSync.runSync();
         if (r) setToast(summarizeAutoSync(r));
@@ -405,18 +435,32 @@ export default function ChatPane({ employee }: Props) {
         )}
 
         <div className="mx-auto flex max-w-3xl flex-col gap-4">
-          {messages.map((m, i) =>
-            m.role === "user" ? (
-              <UserBubble key={i} message={m} />
+          {messages.length > displayCount && (
+            <button
+              onClick={() =>
+                setDisplayCount((c) => Math.min(c + 10, messages.length))
+              }
+              className="self-center rounded-full border border-border bg-surface px-4 py-1.5 text-[11px] text-ink-dim hover:border-accent hover:text-ink"
+            >
+              ↑ โหลดข้อความเก่ากว่า ({messages.length - displayCount} ที่เหลือ)
+            </button>
+          )}
+          {messages.slice(-displayCount).map((m, i) => {
+            // i is offset within the displayed window; compute original index
+            // so the "last message" check still works during streaming.
+            const origIdx = messages.length - displayCount + i;
+            const safeIdx = Math.max(origIdx, i);
+            return m.role === "user" ? (
+              <UserBubble key={safeIdx} message={m} />
             ) : (
               <AssistantBubble
-                key={i}
+                key={safeIdx}
                 message={m}
                 employee={employee}
-                streaming={streaming && i === messages.length - 1}
+                streaming={streaming && safeIdx === messages.length - 1}
               />
-            ),
-          )}
+            );
+          })}
           {outputs.length > 0 && <OutputsPanel outputs={outputs} />}
           {error && (
             <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
@@ -445,7 +489,7 @@ export default function ChatPane({ employee }: Props) {
               ref={fileRef}
               type="file"
               multiple
-              accept="image/*,application/pdf,text/csv,text/plain,application/json,.xls,.xlsx"
+              accept="image/*,.heic,.heif,application/pdf,text/csv,text/plain,application/json,.xls,.xlsx"
               className="hidden"
               onChange={(e) => uploadFiles(e.target.files)}
             />
@@ -464,18 +508,13 @@ export default function ChatPane({ employee }: Props) {
                 </>
               )}
             </button>
-            <textarea
+            <MentionTextarea
               value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  send();
-                }
-              }}
-              placeholder={`พิมพ์ถาม ${employee.name}… (Enter ส่ง, Shift+Enter ขึ้นบรรทัด)`}
+              onChange={setInput}
+              onSubmit={send}
+              placeholder={`พิมพ์ถาม ${employee.name}… (Enter ส่ง, @ เพื่อเรียกคน)`}
               rows={2}
-              className="input min-h-[52px] flex-1"
+              className="input min-h-[52px] flex-1 w-full"
               disabled={streaming}
             />
             {streaming ? (
@@ -500,7 +539,7 @@ export default function ChatPane({ employee }: Props) {
 
 /* ---------- Bubbles ---------- */
 
-function UserBubble({ message }: { message: UserMessage }) {
+const UserBubble = memo(function UserBubble({ message }: { message: UserMessage }) {
   return (
     <div className="flex justify-end gap-3">
       <div className="max-w-[85%] rounded-2xl bg-accent-soft px-4 py-2.5 text-sm leading-relaxed text-white">
@@ -515,9 +554,47 @@ function UserBubble({ message }: { message: UserMessage }) {
       </div>
     </div>
   );
+});
+
+function GeneratedFilesPreview({ files }: { files: GeneratedFile[] }) {
+  const fileUrl = (p: string) =>
+    `/api/outputs/file/${p
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}`;
+  return (
+    <div className="mt-3 space-y-1.5 border-t border-border/60 pt-2">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-ink-dim/70">
+        📁 สร้างไฟล์ {files.length} ตัว
+      </p>
+      <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+        {files.map((f) => (
+          <a
+            key={f.path}
+            href={fileUrl(f.path)}
+            target="_blank"
+            rel="noreferrer"
+            className="group flex flex-col overflow-hidden rounded-lg border border-border/60 bg-surface-2/40 hover:border-accent"
+            title={`${f.name} · ${Math.round(f.size / 1024)} KB`}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={fileUrl(f.path)}
+              alt={f.name}
+              className="aspect-square w-full object-cover transition-opacity group-hover:opacity-80"
+              loading="lazy"
+            />
+            <p className="truncate px-1.5 py-1 text-[10px] text-ink-dim group-hover:text-ink">
+              {f.name}
+            </p>
+          </a>
+        ))}
+      </div>
+    </div>
+  );
 }
 
-function AssistantBubble({
+const AssistantBubble = memo(function AssistantBubble({
   message,
   employee,
   streaming,
@@ -547,26 +624,101 @@ function AssistantBubble({
 
         {showThinking && <ThinkingIndicator />}
 
-        {message.status === "done" && message.durationMs != null && (
-          <div className="mt-2 border-t border-border/60 pt-1.5 text-[10px] text-ink-dim/60">
-            ✓ เสร็จใน {(message.durationMs / 1000).toFixed(1)}s
-          </div>
+        {message.generatedFiles && message.generatedFiles.length > 0 && (
+          <GeneratedFilesPreview files={message.generatedFiles} />
         )}
-        {message.status === "error" && (
-          <div className="mt-2 border-t border-danger/30 pt-1.5 text-[10px] text-danger">
-            ✗ จบด้วย error
+
+        {message.blocks.length > 0 && (
+          <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/60 pt-1.5 text-[10px] text-ink-dim/60">
+            <span>
+              {message.status === "done" && message.durationMs != null && (
+                <>✓ เสร็จใน {(message.durationMs / 1000).toFixed(1)}s</>
+              )}
+              {message.status === "error" && (
+                <span className="text-danger">✗ จบด้วย error</span>
+              )}
+            </span>
+            <CopyButton
+              text={messageTextOnly(message.blocks)}
+              label="ก๊อปคำตอบ"
+            />
           </div>
         )}
       </div>
     </div>
   );
+});
+
+function CopyButton({
+  text,
+  label = "Copy",
+  className = "",
+}: {
+  text: string;
+  label?: string;
+  className?: string;
+}) {
+  const [done, setDone] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={async (e) => {
+        e.stopPropagation();
+        try {
+          await navigator.clipboard.writeText(text);
+          setDone(true);
+          setTimeout(() => setDone(false), 1200);
+        } catch {
+          /* clipboard might be blocked — silent */
+        }
+      }}
+      title={done ? "ก๊อปแล้ว" : "ก๊อปข้อความ"}
+      className={`inline-flex items-center gap-1 rounded border border-border bg-surface px-1.5 py-0.5 text-[10px] text-ink-dim hover:border-accent hover:text-ink ${className}`}
+    >
+      {done ? "✓ ก๊อปแล้ว" : `📋 ${label}`}
+    </button>
+  );
+}
+
+/** Concatenate all text-block content in a message (skip tool/thinking blocks). */
+function messageTextOnly(blocks: AssistantBlock[]): string {
+  return blocks
+    .filter((b): b is Extract<AssistantBlock, { kind: "text" }> => b.kind === "text")
+    .map((b) => b.text)
+    .join("\n\n")
+    .trim();
 }
 
 function BlockView({ block }: { block: AssistantBlock }) {
   if (block.kind === "text") {
     return (
       <div className="markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{block.text}</ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            // Custom code renderer — adds a copy button to block-level code.
+            // Inline code (`like this`) renders as default <code> element.
+            pre: ({ children }) => {
+              // children is normally a single <code> element; extract its text
+              const codeText = extractCodeText(children);
+              return (
+                <div className="group relative my-2">
+                  <pre className="overflow-auto rounded-lg bg-bg/60 p-3 font-mono text-[11.5px] text-ink">
+                    {children}
+                  </pre>
+                  {codeText && (
+                    <CopyButton
+                      text={codeText}
+                      className="absolute right-2 top-2 opacity-0 transition-opacity group-hover:opacity-100"
+                    />
+                  )}
+                </div>
+              );
+            },
+          }}
+        >
+          {block.text}
+        </ReactMarkdown>
       </div>
     );
   }
@@ -574,6 +726,17 @@ function BlockView({ block }: { block: AssistantBlock }) {
     return <ThinkingBlock text={block.text} />;
   }
   return <ToolBlock block={block} />;
+}
+
+/** Pull plain text out of a ReactMarkdown <pre>'s children (which is a <code> element). */
+function extractCodeText(node: React.ReactNode): string {
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(extractCodeText).join("");
+  if (node && typeof node === "object" && "props" in node) {
+    const props = (node as { props?: { children?: React.ReactNode } }).props;
+    return extractCodeText(props?.children);
+  }
+  return "";
 }
 
 function ToolBlock({
@@ -711,7 +874,7 @@ function FileChip({ file, onRemove }: { file: Attachment; onRemove: () => void }
   );
 }
 
-function OutputsPanel({ outputs }: { outputs: OutputFile[] }) {
+const OutputsPanel = memo(function OutputsPanel({ outputs }: { outputs: OutputFile[] }) {
   return (
     <div className="rounded-xl border border-ok/30 bg-ok/5 p-3">
       <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ok">
@@ -746,7 +909,7 @@ function OutputsPanel({ outputs }: { outputs: OutputFile[] }) {
       </ul>
     </div>
   );
-}
+});
 
 /* ---------- Helpers ---------- */
 

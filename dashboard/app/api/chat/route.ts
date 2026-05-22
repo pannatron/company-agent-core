@@ -1,10 +1,13 @@
 import { NextRequest } from "next/server";
 import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { avatarUrl, getEmployee, EmployeeMeta } from "@/lib/employees";
-import { routeMessage } from "@/lib/router";
+import { detectExplicitMention, routeMessage } from "@/lib/router";
 import { buildSystemPrompt } from "@/lib/buildSystemPrompt";
-import { REPO_ROOT } from "@/lib/repo";
+import { REPO_ROOT, DATA_DIR } from "@/lib/repo";
 import { organize } from "@/lib/categorizer";
+import { promises as fsPromises } from "node:fs";
+import nodePath from "node:path";
+import { pushSocialPosts } from "@/lib/socialPostsSync";
 import {
   ChatAttachment,
   ChatBlock,
@@ -29,6 +32,13 @@ interface ChatRequest {
   chatId?: string;
   messages: ClientMessage[];
   attachments?: ChatAttachment[];
+  /**
+   * Slug of the last assistant who replied in this conversation. When
+   * employee === "auto", we use this as a sticky default so the speaker
+   * doesn't ping-pong on every message — keyword routing only kicks in
+   * if there's no prior respondent. Explicit @mentions always win.
+   */
+  last_respondent?: string;
 }
 
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-4-7";
@@ -52,14 +62,28 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  // Pick employee — explicit slug or auto-route
+  // Pick employee — explicit slug or auto-route (mention → sticky → keyword)
   let employee: EmployeeMeta | undefined;
   let routeReason = "";
   if (body.employee === "auto" || !body.employee) {
     const last = messages[messages.length - 1];
-    const r = routeMessage(last.content);
-    employee = getEmployee(r.slug);
-    routeReason = r.reason;
+    const explicit = detectExplicitMention(last.content);
+    if (explicit) {
+      employee = getEmployee(explicit);
+      routeReason = `@mention ${employee?.firstName ?? explicit}`;
+    } else if (body.last_respondent) {
+      // Sticky — continue the same conversation unless user explicitly switches
+      const sticky = getEmployee(body.last_respondent);
+      if (sticky) {
+        employee = sticky;
+        routeReason = `คุยต่อกับ ${sticky.firstName}`;
+      }
+    }
+    if (!employee) {
+      const r = routeMessage(last.content);
+      employee = getEmployee(r.slug);
+      routeReason = r.reason;
+    }
   } else {
     employee = getEmployee(body.employee);
   }
@@ -87,6 +111,16 @@ export async function POST(req: NextRequest) {
   const current = messages[messages.length - 1];
   const attachmentBlock = formatAttachments(body.attachments);
   const turnStart = Date.now();
+
+  // BUG-001 — snapshot mtime so we can auto-push social-posts after the turn
+  // if (and only if) the agent edited it during the turn.
+  const socialPostsPath = nodePath.join(DATA_DIR, "social-posts.json");
+  let socialMtimeAtStart: number | null = null;
+  try {
+    socialMtimeAtStart = (await fsPromises.stat(socialPostsPath)).mtimeMs;
+  } catch {
+    /* file doesn't exist yet — that's fine, treat as no prior state */
+  }
 
   const prompt =
     history.length === 0
@@ -246,6 +280,19 @@ export async function POST(req: NextRequest) {
             durationMs: lastTurnDurationMs || Date.now() - turnStart,
             errored: turnErrored,
           });
+        } catch {
+          /* best-effort */
+        }
+        // 3) BUG-001 — if the agent modified data/social-posts.json during the
+        //    turn, push to Sheet so Apps Script sees the change next cron pass.
+        //    Best-effort: Drive may not be configured; validation may fail —
+        //    surface neither (the client-side useAutoSync already shows errors
+        //    when toggled on). Skip when file unchanged to avoid a wasted RPC.
+        try {
+          const stat = await fsPromises.stat(socialPostsPath);
+          if (socialMtimeAtStart === null || stat.mtimeMs > socialMtimeAtStart) {
+            await pushSocialPosts();
+          }
         } catch {
           /* best-effort */
         }

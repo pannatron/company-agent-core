@@ -12,6 +12,7 @@ import {
 } from "@/lib/employees";
 import { summarizeAutoSync, useAutoSync } from "@/lib/useAutoSync";
 import Avatar from "./Avatar";
+import MentionTextarea from "./MentionTextarea";
 
 interface Attachment {
   path: string;
@@ -43,6 +44,14 @@ type Block =
       preview?: string;
     };
 
+/** A file the agent created during the turn — surfaced as an inline preview. */
+interface GeneratedFile {
+  path: string;
+  name: string;
+  mimeType: string;
+  size: number;
+}
+
 type Msg =
   | {
       role: "user";
@@ -56,6 +65,7 @@ type Msg =
       blocks: Block[];
       status: "streaming" | "done" | "error";
       durationMs?: number;
+      generatedFiles?: GeneratedFile[];
     };
 
 interface Props {
@@ -231,8 +241,16 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
     setPendingFiles([]);
     setStreaming(true);
 
+    const turnStartAt = Date.now();
     const ac = new AbortController();
     abortRef.current = ac;
+
+    // Last assistant who actually replied — used by chat route for sticky
+    // routing so the speaker doesn't ping-pong on every message
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((m): m is Extract<Msg, { role: "assistant" }> => m.role === "assistant");
+    const lastRespondent = lastAssistant?.respondent?.slug;
 
     try {
       const res = await fetch("/api/chat", {
@@ -240,6 +258,7 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           employee: "auto",
+          last_respondent: lastRespondent,
           messages: next
             .slice(0, -1)
             .map((m) =>
@@ -299,6 +318,21 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
       abortRef.current = null;
       onRespondent(null);
       onAgentTurn();
+      // Find images the agent created during this turn and attach as inline previews
+      try {
+        const res = await fetch(
+          `/api/outputs/list?since=${turnStartAt}&includeUploads=0`,
+        );
+        if (res.ok) {
+          const data = (await res.json()) as { files: GeneratedFile[] };
+          const images = data.files.filter((f) => f.mimeType.startsWith("image/"));
+          if (images.length > 0) {
+            updateLast((m) => ({ ...m, generatedFiles: images }));
+          }
+        }
+      } catch {
+        /* ignore — preview is best-effort */
+      }
       // Auto-sync to Drive + Sheets if user has the toggle on
       if (autoSync.enabled) {
         const r = await autoSync.runSync();
@@ -442,7 +476,7 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
               ref={fileRef}
               type="file"
               multiple
-              accept="image/*,application/pdf,text/csv,text/plain,application/json,.xls,.xlsx"
+              accept="image/*,.heic,.heif,application/pdf,text/csv,text/plain,application/json,.xls,.xlsx"
               className="hidden"
               onChange={(e) => uploadFiles(e.target.files)}
             />
@@ -454,18 +488,13 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
             >
               {uploading ? <span className="text-xs">อัปฯ…</span> : <PaperclipIcon />}
             </button>
-            <textarea
+            <MentionTextarea
               value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  send();
-                }
-              }}
-              placeholder="ถามอะไรก็ได้… ระบบจะเรียกพนักงานที่ตรงเรื่องมาตอบ (พิมพ์ @ชื่อ เพื่อระบุ)"
+              onChange={setInput}
+              onSubmit={send}
+              placeholder="ถามอะไรก็ได้… ระบบจะเรียกพนักงานที่ตรงเรื่องมาตอบ (พิมพ์ @ เพื่อเลือกคน)"
               rows={2}
-              className="input min-h-[52px] flex-1"
+              className="input min-h-[52px] flex-1 w-full"
               disabled={streaming}
             />
             {streaming ? (
@@ -565,11 +594,53 @@ function AssistantBubble({
             </div>
           )}
 
+        {message.generatedFiles && message.generatedFiles.length > 0 && (
+          <GeneratedFilesPreview files={message.generatedFiles} />
+        )}
+
         {message.status === "done" && message.durationMs != null && (
           <div className="mt-2 border-t border-border/60 pt-1.5 text-[10px] text-ink-dim/60">
             ✓ เสร็จใน {(message.durationMs / 1000).toFixed(1)}s
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function GeneratedFilesPreview({ files }: { files: GeneratedFile[] }) {
+  const fileUrl = (p: string) =>
+    `/api/outputs/file/${p
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}`;
+  return (
+    <div className="mt-3 space-y-1.5 border-t border-border/60 pt-2">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-ink-dim/70">
+        📁 สร้างไฟล์ {files.length} ตัว
+      </p>
+      <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+        {files.map((f) => (
+          <a
+            key={f.path}
+            href={fileUrl(f.path)}
+            target="_blank"
+            rel="noreferrer"
+            className="group flex flex-col overflow-hidden rounded-lg border border-border/60 bg-surface-2/40 hover:border-accent"
+            title={`${f.name} · ${Math.round(f.size / 1024)} KB`}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={fileUrl(f.path)}
+              alt={f.name}
+              className="aspect-square w-full object-cover transition-opacity group-hover:opacity-80"
+              loading="lazy"
+            />
+            <p className="truncate px-1.5 py-1 text-[10px] text-ink-dim group-hover:text-ink">
+              {f.name}
+            </p>
+          </a>
+        ))}
       </div>
     </div>
   );

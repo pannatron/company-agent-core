@@ -1,6 +1,7 @@
 "use client";
 
-import { EmployeeMeta } from "@/lib/employees";
+import Image from "next/image";
+import { EmployeeMeta, avatarUrl } from "@/lib/employees";
 import { kpiStatusColor, KpiItem } from "./kpi-utils";
 
 interface Props {
@@ -31,8 +32,14 @@ export default function EmployeeCard({
       ].join(" ")}
     >
       <div className="flex items-start gap-3">
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-accent-soft/20 font-mono text-sm font-semibold text-accent">
-          {employee.emoji}
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-accent-soft/20 font-mono text-sm font-semibold text-accent">
+          <Image
+            src={avatarUrl(employee.avatarSeed, 80)}
+            alt={employee.name}
+            width={40}
+            height={40}
+            unoptimized
+          />
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
