@@ -140,3 +140,155 @@ export async function runFbSchedulerNow(): Promise<{
   if (!r.ok) throw new Error(r.error || "run_fb_scheduler_now failed");
   return r.result ?? { published: 0, errors: 0, skipped: 0 };
 }
+
+/**
+ * Publish a single queued post right now, bypassing the 5-min cron (BUG-004).
+ * The Apps Script side does the actual Graph API call + writes back the
+ * external_url / status / diagnostics to the Sheet row.
+ */
+export async function postNow(post_id: string): Promise<{
+  external_url: string;
+  post_id: string;
+}> {
+  const url = await loadDriveUrl();
+  const r = await callScript<{
+    ok: boolean;
+    external_url?: string;
+    post_id?: string;
+    error?: string;
+  }>(url, { action: "fb_post_now", post_id });
+  if (!r.ok) {
+    const msg = r.error || "fb_post_now failed";
+    if (/unknown action/i.test(msg)) {
+      throw new Error(
+        "Apps Script ของคุณยังไม่ใช่ v8 — ก๊อปสคริปต์ใหม่จาก Files tab แล้ว redeploy",
+      );
+    }
+    throw new Error(msg);
+  }
+  return {
+    external_url: r.external_url || "",
+    post_id: r.post_id || post_id,
+  };
+}
+
+/**
+ * Reset a failed row back to status=scheduled with attempt_count=0 so the
+ * next scheduler pass will retry it (BUG-003 retry helper).
+ */
+export async function retryPost(post_id: string): Promise<{ post_id: string }> {
+  const url = await loadDriveUrl();
+  const r = await callScript<{ ok: boolean; post_id?: string; error?: string }>(
+    url,
+    { action: "fb_retry_post", post_id },
+  );
+  if (!r.ok) {
+    const msg = r.error || "fb_retry_post failed";
+    if (/unknown action/i.test(msg)) {
+      throw new Error(
+        "Apps Script ของคุณยังไม่ใช่ v8 — ก๊อปสคริปต์ใหม่จาก Files tab แล้ว redeploy",
+      );
+    }
+    throw new Error(msg);
+  }
+  return { post_id: r.post_id || post_id };
+}
+
+/* ============================================================
+ *   v9 — Post delete + Comments inbox
+ *   (Apps Script must have v9 patch applied — see
+ *    outputs/misc/apps-script-v9-comments-patch.gs)
+ * ============================================================ */
+
+function throwV9IfUnknown(err: string, fallback: string): never {
+  if (/unknown action/i.test(err)) {
+    throw new Error(
+      "Apps Script ของคุณยังไม่ใช่ v9 — paste outputs/misc/apps-script-v9-comments-patch.gs แล้ว redeploy",
+    );
+  }
+  throw new Error(err || fallback);
+}
+
+/** Delete a published FB post. Accepts either "pageId_postId" or the external_url. */
+export async function deletePost(post_id_or_url: string): Promise<{ fb_post_id: string }> {
+  const url = await loadDriveUrl();
+  const r = await callScript<{ ok: boolean; fb_post_id?: string; error?: string }>(
+    url,
+    { action: "fb_delete_post", post_id: post_id_or_url },
+  );
+  if (!r.ok) throwV9IfUnknown(r.error || "", "fb_delete_post failed");
+  return { fb_post_id: r.fb_post_id || "" };
+}
+
+/** Trigger Apps Script to poll FB for new comments on all published posts. */
+export async function syncComments(): Promise<{
+  new_count: number;
+  polled: number;
+}> {
+  const url = await loadDriveUrl();
+  const r = await callScript<{
+    ok: boolean;
+    new_count?: number;
+    polled?: number;
+    error?: string;
+  }>(url, { action: "fb_sync_comments" });
+  if (!r.ok) throwV9IfUnknown(r.error || "", "fb_sync_comments failed");
+  return { new_count: r.new_count ?? 0, polled: r.polled ?? 0 };
+}
+
+/** Pull the canonical "comments" tab from Sheets — returns headers + rows. */
+export async function fetchCommentsFromSheet(): Promise<{
+  headers: string[];
+  rows: string[][];
+}> {
+  const url = await loadDriveUrl();
+  const r = await callScript<{
+    ok: boolean;
+    headers?: string[];
+    rows?: string[][];
+    error?: string;
+  }>(url, { action: "fb_list_comments" });
+  if (!r.ok) throwV9IfUnknown(r.error || "", "fb_list_comments failed");
+  return { headers: r.headers || [], rows: r.rows || [] };
+}
+
+/** Post a reply to a FB comment. The Apps Script side updates the Sheet row. */
+export async function replyComment(args: {
+  comment_id: string;
+  message: string;
+  replied_by?: string;
+}): Promise<{ reply_id: string }> {
+  const url = await loadDriveUrl();
+  const r = await callScript<{ ok: boolean; reply_id?: string; error?: string }>(
+    url,
+    { action: "fb_reply_comment", ...args },
+  );
+  if (!r.ok) throwV9IfUnknown(r.error || "", "fb_reply_comment failed");
+  return { reply_id: r.reply_id || "" };
+}
+
+/** Delete a FB comment via Graph API DELETE /{comment_id}. */
+export async function deleteComment(args: {
+  comment_id: string;
+  replied_by?: string;
+}): Promise<void> {
+  const url = await loadDriveUrl();
+  const r = await callScript<AppsScriptResponse>(url, {
+    action: "fb_delete_comment",
+    ...args,
+  });
+  if (!r.ok) throwV9IfUnknown(r.error || "", "fb_delete_comment failed");
+}
+
+/** Mark a comment as ignored locally (no FB call). */
+export async function ignoreComment(args: {
+  comment_id: string;
+  replied_by?: string;
+}): Promise<void> {
+  const url = await loadDriveUrl();
+  const r = await callScript<AppsScriptResponse>(url, {
+    action: "fb_ignore_comment",
+    ...args,
+  });
+  if (!r.ok) throwV9IfUnknown(r.error || "", "fb_ignore_comment failed");
+}
