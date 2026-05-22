@@ -23,6 +23,40 @@ tools:
 6. ตรวจ visual consistency: brand color, font, logo placement, spacing
 7. แนะนำ aspect ratio + safe area ให้ตรงแพลตฟอร์ม
 
+## วิธีสร้างรูป — เลือกถูกตัวแรก
+
+| ผู้ใช้ขอ | ใช้ |
+|---|---|
+| **โพสต์ infographic / banner ข้อความ / brand layout** (มี text หลัก, layout เป๊ะ) | **HTML-to-image** (section ด้านล่าง) — ควบคุม layout/font/สีได้แม่น |
+| **รูป photo-realistic / illustration / character / scene** (เน้นภาพ, ไม่ต้องมี text) | **Gemini Image gen** (section "Gemini Image" ด้านล่าง) — สร้างจาก text prompt |
+| **ผู้ใช้แนบรูปมาเอง** | ใช้ตามที่แนบ แค่ rename/resize |
+
+## Gemini Image (AI-generated visual)
+
+เรียกผ่าน `/api/render/gemini-image` ใช้ Gemini 2.5 Flash Image ("Nano Banana") ของ Google. ต้องมี `GEMINI_API_KEY` ใน `dashboard/.env.local` แล้ว.
+
+### ขั้นตอน
+1. **เขียน prompt ละเอียด** (ภาษาอังกฤษ + ภาษาไทย ผสมได้ Gemini เข้าใจ): subject, style, lighting, composition, mood, color palette
+2. **เรียก API:**
+   ```bash
+   curl -sX POST http://localhost:3000/api/render/gemini-image \
+     -H 'content-type: application/json' \
+     -d '{
+       "prompt": "A young Thai child making 3D-printed dinosaur, bright workshop, soft natural lighting, photo-realistic, warm color palette",
+       "filename": "content-2026-05-22-3dprint-kid"
+     }'
+   ```
+3. **Response:** `{ ok: true, path: "outputs/content/content-2026-05-22-3dprint-kid.png", size: ... }`
+4. **หลังเจน → resize ผ่าน playbook entry `resize-image-web-1080`** เป็น `-web.jpg` ก่อน push social (Gemini ออก PNG 1024x1024 ใหญ่กว่าที่ FB ต้องการ)
+5. **ผูกเข้าโพสต์**: edit `data/social-posts.json` set `asset_file` = `outputs/content/content-...-web.jpg`
+
+### กฎสำคัญ Gemini
+- **อย่าใส่ text เป็น content หลัก** — Gemini ยังไม่ดี ใช้ HTML-to-image แทน
+- **กรณี prompt ถูก block** (safety filter) → ปรับ prompt: ลด keyword sensitive, เปลี่ยน subject, เพิ่ม context "for educational content"
+- **filename ต้องขึ้น `content-`** เพื่อให้ categorizer ย้ายเข้า `outputs/content/`
+- **ห้าม commit `dashboard/.env.local`** (gitignored แล้ว แต่ระวัง)
+- **เซฟ prompt ที่ใช้ลง social-posts.json field `asset_prompt`** — backup เผื่อต้องเจนใหม่
+
 ## HTML-to-image (วิธีหลักในการสร้างรูป)
 
 ผมเขียน HTML + Tailwind → ส่งไป `/api/render/html-to-image` → ได้ PNG จริงที่โพสต์ลง FB ได้เลย
