@@ -113,6 +113,60 @@ BOROT Company/
 
 **Dashboard:** หน้า Files มี panel "📊 Google Sheets" — กด pull/push ทีละหัวข้อหรือทั้งหมดได้ และมีปุ่ม "สร้าง Sheets ทุกหัวข้อ" สำหรับ init ครั้งแรก
 
+## Learned Playbook (สำคัญ — agent ทุกตัวอ่าน)
+
+`data/playbook.json` เก็บคำสั่ง/ขั้นตอนที่ **work จริงในเครื่องนี้** ทุก agent ใช้ร่วมกัน เพื่อไม่ต้องลองผิดลองถูกซ้ำ (ก่อนแก้ระบบนี้: agent เสีย 5-6 tool turns ลองผิด `date`, `sips`, `cp` paths)
+
+### Schema
+```json
+{
+  "entries": [
+    {
+      "id": "kebab-slug",
+      "task": "อธิบาย task เป็นภาษาคน (1 บรรทัด ให้ agent อื่น match ได้)",
+      "command": "shell command พร้อม {placeholder}",
+      "platform": "darwin" | "linux" | "win32" | "*",
+      "fallback": "command อีกตัว (optional)",
+      "fallback_platform": "linux|win32",
+      "verified_at": "YYYY-MM-DD",
+      "verified_by": "ชื่อ agent หรือ system-seed",
+      "notes": "quirks/gotchas (optional)"
+    }
+  ]
+}
+```
+
+### กฎการใช้ playbook (ทุก agent)
+
+**ก่อนรัน shell command ที่อาจ platform-specific** (date, file ops, image tools, archive, ฯลฯ):
+1. **Grep playbook ก่อน** — `grep -i "<keyword>" data/playbook.json` หรือ Read แล้วหา `entries[*].task` ที่ใกล้เคียง
+2. **เจอ + platform ตรง** (`uname -s` == entry.platform หรือ entry.platform == `"*"`) → **ใช้คำสั่งนั้นเลย** แทน {placeholder} ด้วยค่าจริง อย่าคิดเอง
+3. **เจอ task ตรง แต่ platform ไม่ตรง** → ใช้ `fallback` ถ้ามี ไม่งั้นค่อยคิดเอง
+4. **ไม่เจอ** → คิดคำสั่งเอง รัน ถ้า work → **append entry ใหม่** ลง playbook ทันที (อ่าน-edit-save ผ่าน Edit tool, ห้ามลบของคนอื่น)
+
+**ที่ควรเซฟลง playbook**:
+- คำสั่งที่เคยลองผิดลองถูก (sips/imagemagick, ffmpeg, date, find -exec)
+- API endpoint ของ dashboard (curl URL + payload pattern)
+- Path quirks ของเครื่อง user (ที่อยู่ของ asset, output, dashboard port)
+- ขั้นตอนยาวที่มีโอกาสพลาดถ้าทำซ้ำ (เช่น "rename + move + sync slip การเงิน 5 step")
+
+**ที่ไม่ควรเซฟ**:
+- คำสั่ง one-off (เช่น "Edit ไฟล์ X บรรทัด Y" — เป็น context-specific)
+- ข้อมูลจริง (ตัวเลข KPI, ชื่อลูกค้า) — playbook เก็บแค่ "วิธีทำ" ไม่ใช่ "ข้อมูล"
+- ข้อมูล secret (token, password) — ห้ามเด็ดขาด
+
+**ตัวอย่าง flow**:
+```
+user: ตั้งโพสต์รูปนี้ลงเฟส
+agent: [Grep playbook "resize" → เจอ entry resize-image-web-1080]
+agent: [รัน sips -Z 1080 ... ทันที — ไม่ลองคำสั่งอื่น]
+agent: [Grep playbook "schedule" → เจอ schedule-at-now-plus-n-min-th]
+agent: [รัน TZ=Asia/Bangkok date -v+2M ... ทันที]
+agent: [...append post, push sheet via curl entry...]
+```
+
+ครั้งแรก seed มี 3 entries: `resize-image-web-1080`, `schedule-at-now-plus-n-min-th`, `push-social-sheet` — entries จะเติมเองตามที่ agent ใช้งานจริง
+
 ## Slash commands ที่มี
 
 - `/daily-standup` — สรุป pipeline + KPI + ticket ค้าง ทุกเช้า
