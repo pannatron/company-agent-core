@@ -53,10 +53,18 @@ export function useAutoSync() {
     const runId = ++runIdRef.current;
     setSyncing(true);
     try {
-      const [driveRes, sheetsRes, socialRes] = await Promise.allSettled([
+      // BUG-005: Drive sync MUST finish before pushing social posts, because
+      // social push reads .drive-state.json to attach asset_drive_id to each
+      // row. If they run in parallel, a brand-new image file lands on Drive
+      // *after* social push reads the state, so the row ships with an empty
+      // asset_drive_id and Apps Script falls back to text-only.
+      const driveRes = await Promise.allSettled([
         fetch("/api/drive/sync", { method: "POST" }).then((r) =>
           r.ok ? r.json() : r.json().then((j) => Promise.reject(j.error || `HTTP ${r.status}`)),
         ),
+      ]).then((arr) => arr[0]);
+
+      const [sheetsRes, socialRes] = await Promise.allSettled([
         fetch("/api/sheets/push", { method: "POST" }).then((r) =>
           r.ok ? r.json() : r.json().then((j) => Promise.reject(j.error || `HTTP ${r.status}`)),
         ),

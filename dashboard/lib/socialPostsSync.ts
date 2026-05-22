@@ -2,6 +2,8 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { DATA_DIR } from "./repo";
 import { parseCsv } from "./sheetSync";
+import { withFileLock } from "./fileLock";
+import { syncAll as syncDriveAll, isConfigured as isDriveConfigured } from "./driveSync";
 
 /**
  * social-posts.json ↔ Google Sheets mirror.
@@ -192,7 +194,9 @@ async function readSocialFile(): Promise<SocialFile> {
 async function writeSocialFile(data: SocialFile): Promise<void> {
   await fs.mkdir(path.dirname(SOCIAL_PATH), { recursive: true });
   data.updated_at = new Date().toISOString().slice(0, 10);
-  await fs.writeFile(SOCIAL_PATH, JSON.stringify(data, null, 2), "utf8");
+  await withFileLock(SOCIAL_PATH, () =>
+    fs.writeFile(SOCIAL_PATH, JSON.stringify(data, null, 2), "utf8"),
+  );
 }
 
 /**
@@ -437,6 +441,55 @@ export async function pushSocialPosts(): Promise<{
   if (issues.length > 0) {
     throw new SocialPostValidationError(issues);
   }
+
+  // BUG-006: Catch posts that are about to be published but whose image asset
+  // isn't on Drive yet. If we let these through, Apps Script publishes the
+  // post as text-only (no fallback) and we silently lose the image.
+  //
+  // First pass: try to auto-sync missing assets to Drive so the user doesn't
+  // have to babysit. Only if the file is *still* missing after sync do we
+  // throw — usually that means the asset_file path is wrong or the file
+  // doesn't exist on disk.
+  const collectMissing = async (): Promise<ValidationIssue[]> => {
+    resetDriveStateCache();
+    const missing: ValidationIssue[] = [];
+    for (const p of data.posts) {
+      const willBePublished = p.status === "scheduled" || p.status === "approved";
+      if (!willBePublished) continue;
+      if (!p.asset_file) continue; // text-only post — OK
+      if (p.asset_drive_id) continue; // explicitly set
+      const driveId = await lookupDriveId(p.asset_file);
+      if (driveId) continue;
+      if (p.asset_url) continue; // external URL fallback — Apps Script will use it
+      missing.push({
+        post_id: p.id,
+        field: "asset_drive_id",
+        message: `asset_file "${p.asset_file}" ยังไม่ sync ขึ้น Drive`,
+      });
+    }
+    return missing;
+  };
+
+  let assetIssues = await collectMissing();
+  if (assetIssues.length > 0 && (await isDriveConfigured())) {
+    // Try an opportunistic drive sync so the user doesn't have to switch
+    // tabs and click manually. Swallow errors — we'll re-validate and emit
+    // a clear message either way.
+    try {
+      await syncDriveAll();
+    } catch {
+      /* fall through to second validation pass */
+    }
+    assetIssues = await collectMissing();
+  }
+  if (assetIssues.length > 0) {
+    // Re-message now that we know auto-sync didn't help.
+    for (const iss of assetIssues) {
+      iss.message = `${iss.message} — ลอง sync เองแล้วก็ยังไม่เจอ; ตรวจว่าไฟล์มีอยู่จริงในเครื่อง หรือใส่ asset_url แทน (ถ้า push เลย รูปจะหายตอนโพสต์จริง)`;
+    }
+    throw new SocialPostValidationError(assetIssues);
+  }
+
   const rows = await postsToRows(data.posts);
   const r = await callScript<WriteSheetResponse>(url, {
     action: "write_sheet",
