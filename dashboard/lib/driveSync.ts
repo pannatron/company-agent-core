@@ -41,10 +41,25 @@ interface DriveState {
   files: Record<string, FileSyncEntry>;
 }
 
+/**
+ * File-level detail for each sync outcome (BUG-005). Counts are derivable from
+ * `.length`, so dashboard / auto-sync code can stay backward-compatible.
+ */
+export interface SyncFileEntry {
+  /** Repo-relative path, e.g. "outputs/content/launch.png" */
+  file: string;
+  /** Drive file id, present for uploaded/updated entries */
+  drive_id?: string;
+  /** Drive web URL, present for uploaded/updated entries */
+  url?: string;
+  /** "unchanged_mtime" for skipped, error message for errors */
+  reason?: string;
+}
+
 export interface SyncResult {
-  uploaded: number;
-  updated: number;
-  skipped: number;
+  uploaded: SyncFileEntry[];
+  updated: SyncFileEntry[];
+  skipped: SyncFileEntry[];
   errors: { file: string; message: string }[];
 }
 
@@ -236,15 +251,16 @@ export async function syncAll(): Promise<SyncResult> {
   if (!cfg) throw new Error("Drive ยังไม่ได้เชื่อม");
 
   const state = await loadState();
-  const result: SyncResult = { uploaded: 0, updated: 0, skipped: 0, errors: [] };
+  const result: SyncResult = { uploaded: [], updated: [], skipped: [], errors: [] };
 
   for await (const full of walkOutputs(OUTPUTS_DIR)) {
+    const repoRel = path.relative(REPO_ROOT, full).split(path.sep).join("/");
     try {
       const rel = path.relative(OUTPUTS_DIR, full).split(path.sep);
       const categoryId = rel.length > 1 ? rel[0] : "misc";
       const fileName = rel[rel.length - 1];
       const stat = await fs.stat(full);
-      const baseKey = path.relative(REPO_ROOT, full).split(path.sep).join("/");
+      const baseKey = repoRel;
 
       const cat = getCategory(categoryId);
       const folderName = `${cat.icon} ${cat.label}`;
@@ -257,7 +273,12 @@ export async function syncAll(): Promise<SyncResult> {
         const stateKey = `${baseKey}#${dest.tag}`;
         const existing = state.files[stateKey];
         if (existing && existing.size_at_sync === stat.size) {
-          result.skipped++;
+          result.skipped.push({
+            file: stateKey,
+            drive_id: existing.drive_id,
+            url: existing.url,
+            reason: "unchanged_mtime",
+          });
           continue;
         }
         if (!buf) buf = await fs.readFile(full);
@@ -281,12 +302,17 @@ export async function syncAll(): Promise<SyncResult> {
           size_at_sync: stat.size,
           category: categoryId,
         };
-        if (existing) result.updated++;
-        else result.uploaded++;
+        const entry: SyncFileEntry = {
+          file: stateKey,
+          drive_id: r.id,
+          url: r.url,
+        };
+        if (existing) result.updated.push(entry);
+        else result.uploaded.push(entry);
       }
     } catch (e) {
       result.errors.push({
-        file: path.relative(REPO_ROOT, full),
+        file: repoRel,
         message: (e as Error).message,
       });
     }
@@ -363,6 +389,12 @@ const SETUP_FILES = [
   "employees.csv",
   "finance.csv",
   "tickets.csv",
+  // Brand assets — backed up so logo survives reinstalls + is restored on first sync
+  "company-logo.png",
+  "company-logo.jpg",
+  "company-logo.jpeg",
+  "company-logo.webp",
+  "company-logo.svg",
 ];
 
 const CHATS_PREFIX = "chats__";
@@ -650,13 +682,18 @@ export function extractFolderId(url: string): string | null {
 export function buildAppsScriptTemplate(targetFolderId?: string): string {
   const baked = (targetFolderId ?? "").trim();
   return `/**
- * Virtual AI Company — Drive Sync receiver  (v6)
+ * Virtual AI Company — Drive Sync receiver  (v8)
  *
- * What's new in v6:
- *   - Facebook Page auto-posting via Graph API
- *   - Time-driven trigger (runFbScheduler) reads Social Posts sheet, publishes due rows
- *   - Page ID + Page Access Token kept in ScriptProperties (not in code/source)
- *   - Backward-compatible: v5 sheets actions + v1–v4 drive actions ใช้ต่อได้
+ * What's new in v8:
+ *   - Diagnostic writeback: every scheduler run records last_attempt_at,
+ *     attempt_count, error_log on the Sheet row (BUG-003 fix). After 3
+ *     attempts the row is auto-marked status=failed.
+ *   - "fb_post_now" action: bypass the cron and publish a single row right
+ *     now (BUG-004 fix). Updates the row in place same as the scheduler.
+ *
+ * v7:
+ *   - Image posting via DriveApp.getFileById().getBlob() → multipart upload
+ *   - Falls back to URL-based photo, then text-only
  *
  * วิธี deploy:
  *   1. ก๊อปทั้งไฟล์นี้ ไปวางที่ https://script.google.com (ทับโค้ดเดิม) → Save
@@ -665,7 +702,8 @@ export function buildAppsScriptTemplate(targetFolderId?: string): string {
  *      (URL เดิม /exec ใช้ต่อได้ ไม่ต้องเปลี่ยน)
  */
 
-const SCRIPT_VERSION = "6";
+const SCRIPT_VERSION = "8";
+const MAX_ATTEMPTS = 3;
 const BACKUP_FOLDER_NAME = "⚙ Setup Backup";
 const FB_TRIGGER_FN = "runFbScheduler";
 const SOCIAL_FOLDER = "📱 Social";
@@ -879,7 +917,7 @@ function doPost(e) {
       const message = String(body.message || "").trim();
       if (!message) return json_({ ok: false, error: "message required" });
       try {
-        const url = publishToFb_(cfg, message, body.image_url || "");
+        const url = publishToFb_(cfg, message, body.image_url || "", body.drive_id || "");
         return json_({ ok: true, external_url: url });
       } catch (e) {
         return json_({ ok: false, error: String(e) });
@@ -905,6 +943,18 @@ function doPost(e) {
       return json_({ ok: true, result: result });
     }
 
+    if (body.action === "fb_post_now") {
+      if (!body.post_id) return json_({ ok: false, error: "post_id required" });
+      const result = fbPostNowImpl_(String(body.post_id));
+      return json_(result);
+    }
+
+    if (body.action === "fb_retry_post") {
+      if (!body.post_id) return json_({ ok: false, error: "post_id required" });
+      const result = fbResetRowImpl_(String(body.post_id));
+      return json_(result);
+    }
+
     return json_({ ok: false, error: "unknown action: " + body.action });
   } catch (err) {
     return json_({ ok: false, error: String(err) });
@@ -915,7 +965,7 @@ function doGet() {
   return json_({
     ok: true,
     script_version: SCRIPT_VERSION,
-    hint: "POST {action:'ping'|'upload'|'list_backup'|'download'|'init_sheet'|'list_workbooks'|'read_sheet'|'write_sheet',...}",
+    hint: "POST {action:'ping'|'upload'|'list_backup'|'download'|'init_sheet'|'list_workbooks'|'read_sheet'|'write_sheet'|'fb_post_now'|'fb_retry_post'|...}",
   });
 }
 
@@ -1138,18 +1188,8 @@ function runFbSchedulerImpl_() {
     props.setProperty("FB_LAST_RESULT", "queue ว่าง");
     return { published: 0, errors: 0, skipped: 0, note: "empty queue" };
   }
+  const cols = scanSocialColumns_(sheet);
   const all = sheet.getRange(1, 1, lastRow, lastCol).getValues();
-  const headers = all[0].map(function (h) { return String(h); });
-  const colOf = function (name) { return headers.indexOf(name); };
-  const iId = colOf("post_id");
-  const iPlatform = colOf("platform");
-  const iStatus = colOf("status");
-  const iSched = colOf("scheduled_at");
-  const iCopy = colOf("copy");
-  const iAssetUrl = colOf("asset_url");
-  const iExternal = colOf("external_url");
-  const iPub = colOf("published_at");
-  const iErr = colOf("error");
 
   const now = new Date();
   let published = 0;
@@ -1159,8 +1199,8 @@ function runFbSchedulerImpl_() {
 
   for (var r = 1; r < all.length; r++) {
     const row = all[r];
-    const platform = String(row[iPlatform] || "").toLowerCase();
-    const status = String(row[iStatus] || "").toLowerCase();
+    const platform = String(row[cols.iPlatform] || "").toLowerCase();
+    const status = String(row[cols.iStatus] || "").toLowerCase();
     if (platform.indexOf("facebook") < 0 && platform !== "fb") {
       skipped++;
       continue;
@@ -1169,43 +1209,41 @@ function runFbSchedulerImpl_() {
       skipped++;
       continue;
     }
-    const sched = row[iSched];
+    const sched = row[cols.iSched];
     const schedDate = sched ? (sched instanceof Date ? sched : new Date(String(sched))) : null;
     if (schedDate && schedDate.getTime() > now.getTime()) {
       skipped++;
       continue;
     }
-    const message = String(row[iCopy] || "").trim();
+    const prevAttempts = cols.iAttemptCount >= 0 ? parseInt(String(row[cols.iAttemptCount] || "0"), 10) || 0 : 0;
+    const message = String(row[cols.iCopy] || "").trim();
     if (!message) {
-      updates.push({ row: r, status: "error", error: "ไม่มี copy" });
+      updates.push(buildFailureUpdate_(r, prevAttempts, "ไม่มี copy"));
       errors++;
       continue;
     }
     try {
-      const url = publishToFb_(cfg, message, String(row[iAssetUrl] || ""));
+      const driveId = cols.iAssetDriveId >= 0 ? String(row[cols.iAssetDriveId] || "") : "";
+      const assetUrl = cols.iAssetUrl >= 0 ? String(row[cols.iAssetUrl] || "") : "";
+      const url = publishToFb_(cfg, message, assetUrl, driveId);
       updates.push({
         row: r,
         status: "published",
         external_url: url,
         published_at: new Date().toISOString(),
         error: "",
+        last_attempt_at: new Date().toISOString(),
+        attempt_count: prevAttempts + 1,
+        error_log: "",
       });
       published++;
     } catch (e) {
-      updates.push({ row: r, status: "error", error: String(e) });
+      updates.push(buildFailureUpdate_(r, prevAttempts, String(e)));
       errors++;
     }
   }
 
-  // Apply updates back to the sheet (1-indexed; row 0 in all[] is the header so +1)
-  for (var u = 0; u < updates.length; u++) {
-    const up = updates[u];
-    const sheetRow = up.row + 1;
-    if (iStatus >= 0 && up.status) sheet.getRange(sheetRow, iStatus + 1).setValue(up.status);
-    if (iExternal >= 0 && up.external_url != null) sheet.getRange(sheetRow, iExternal + 1).setValue(up.external_url);
-    if (iPub >= 0 && up.published_at) sheet.getRange(sheetRow, iPub + 1).setValue(up.published_at);
-    if (iErr >= 0) sheet.getRange(sheetRow, iErr + 1).setValue(up.error || "");
-  }
+  applyRowUpdates_(sheet, cols, updates);
 
   props.setProperty("FB_LAST_RUN_AT", now.toISOString());
   props.setProperty("FB_LAST_RESULT", "published=" + published + " errors=" + errors + " skipped=" + skipped);
@@ -1213,38 +1251,200 @@ function runFbSchedulerImpl_() {
   return { published: published, errors: errors, skipped: skipped };
 }
 
+/** Map a Social Posts sheet's headers → column indices (one place to keep in sync). */
+function scanSocialColumns_(sheet) {
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function (h) { return String(h); });
+  const colOf = function (name) { return headers.indexOf(name); };
+  return {
+    headers: headers,
+    iId: colOf("post_id"),
+    iPlatform: colOf("platform"),
+    iStatus: colOf("status"),
+    iSched: colOf("scheduled_at"),
+    iCopy: colOf("copy"),
+    iAssetUrl: colOf("asset_url"),
+    iAssetDriveId: colOf("asset_drive_id"),
+    iExternal: colOf("external_url"),
+    iPub: colOf("published_at"),
+    iErr: colOf("error"),
+    iLastAttempt: colOf("last_attempt_at"),
+    iAttemptCount: colOf("attempt_count"),
+    iErrLog: colOf("error_log"),
+  };
+}
+
 /**
- * Publish to a Facebook Page.
- * If image_url is a publicly-accessible http(s) URL, posts as a photo with caption.
- * Otherwise posts text-only.
- * Returns the post URL.
+ * Build the row update for a failed publish attempt. If we've already retried
+ * MAX_ATTEMPTS - 1 times, lock the post to status=failed so the cron stops
+ * banging on it. Otherwise keep status=scheduled for the next pass.
  */
-function publishToFb_(cfg, message, image_url) {
-  const isUrl = image_url && /^https?:\\/\\//i.test(image_url);
-  let endpoint;
-  const payload = { access_token: cfg.page_token };
-  if (isUrl) {
-    endpoint = "https://graph.facebook.com/v18.0/" + cfg.page_id + "/photos";
-    payload.url = image_url;
-    payload.caption = message;
-  } else {
-    endpoint = "https://graph.facebook.com/v18.0/" + cfg.page_id + "/feed";
-    payload.message = message;
+function buildFailureUpdate_(rowIdx, prevAttempts, errorText) {
+  const nextAttempts = prevAttempts + 1;
+  const newStatus = nextAttempts >= MAX_ATTEMPTS ? "failed" : "scheduled";
+  return {
+    row: rowIdx,
+    status: newStatus,
+    error: errorText.slice(0, 500),
+    last_attempt_at: new Date().toISOString(),
+    attempt_count: nextAttempts,
+    error_log: errorText.slice(0, 500),
+  };
+}
+
+/** Apply a list of update objects back to the sheet using the indices from scanSocialColumns_. */
+function applyRowUpdates_(sheet, cols, updates) {
+  for (var u = 0; u < updates.length; u++) {
+    const up = updates[u];
+    const sheetRow = up.row + 1;
+    if (cols.iStatus >= 0 && up.status) sheet.getRange(sheetRow, cols.iStatus + 1).setValue(up.status);
+    if (cols.iExternal >= 0 && up.external_url != null) sheet.getRange(sheetRow, cols.iExternal + 1).setValue(up.external_url);
+    if (cols.iPub >= 0 && up.published_at) sheet.getRange(sheetRow, cols.iPub + 1).setValue(up.published_at);
+    if (cols.iErr >= 0 && up.error != null) sheet.getRange(sheetRow, cols.iErr + 1).setValue(up.error);
+    if (cols.iLastAttempt >= 0 && up.last_attempt_at) sheet.getRange(sheetRow, cols.iLastAttempt + 1).setValue(up.last_attempt_at);
+    if (cols.iAttemptCount >= 0 && up.attempt_count != null) sheet.getRange(sheetRow, cols.iAttemptCount + 1).setValue(up.attempt_count);
+    if (cols.iErrLog >= 0 && up.error_log != null) sheet.getRange(sheetRow, cols.iErrLog + 1).setValue(up.error_log);
   }
+}
+
+/**
+ * Publish a single row right now, bypassing the time trigger (BUG-004).
+ * Same writeback semantics as the scheduler so the Sheet stays consistent.
+ */
+function fbPostNowImpl_(postId) {
+  const cfg = fbConfig_();
+  if (!cfg.page_id || !cfg.page_token) {
+    return { ok: false, error: "ตั้ง FB Page ID + Token ก่อน" };
+  }
+  const ss = findSheet_(SOCIAL_FOLDER, SOCIAL_FILE);
+  if (!ss) return { ok: false, error: "ไม่พบ Social Posts sheet — push social-posts ก่อน" };
+  const sheet = ss.getSheetByName(SOCIAL_TAB);
+  if (!sheet) return { ok: false, error: "ไม่พบ tab " + SOCIAL_TAB };
+  const cols = scanSocialColumns_(sheet);
+  const lastRow = sheet.getLastRow();
+  if (cols.iId < 0 || lastRow < 2) return { ok: false, error: "queue ว่างหรือไม่มี post_id column" };
+  const all = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  let rowIdx = -1;
+  for (var i = 0; i < all.length; i++) {
+    if (String(all[i][cols.iId]) === postId) { rowIdx = i + 1; break; }
+  }
+  if (rowIdx < 0) return { ok: false, error: "ไม่พบ post_id: " + postId };
+  const row = all[rowIdx - 1];
+  const message = String(row[cols.iCopy] || "").trim();
+  if (!message) return { ok: false, error: "post นี้ไม่มี copy" };
+  const prevAttempts = cols.iAttemptCount >= 0 ? parseInt(String(row[cols.iAttemptCount] || "0"), 10) || 0 : 0;
+  try {
+    const driveId = cols.iAssetDriveId >= 0 ? String(row[cols.iAssetDriveId] || "") : "";
+    const assetUrl = cols.iAssetUrl >= 0 ? String(row[cols.iAssetUrl] || "") : "";
+    const url = publishToFb_(cfg, message, assetUrl, driveId);
+    applyRowUpdates_(sheet, cols, [{
+      row: rowIdx,
+      status: "published",
+      external_url: url,
+      published_at: new Date().toISOString(),
+      error: "",
+      last_attempt_at: new Date().toISOString(),
+      attempt_count: prevAttempts + 1,
+      error_log: "",
+    }]);
+    return { ok: true, external_url: url, post_id: postId };
+  } catch (e) {
+    applyRowUpdates_(sheet, cols, [buildFailureUpdate_(rowIdx, prevAttempts, String(e))]);
+    return { ok: false, error: String(e), post_id: postId };
+  }
+}
+
+/**
+ * Reset a row that previously errored back to status=scheduled with
+ * attempt_count=0 and clear error_log. The next scheduler pass will retry it.
+ */
+function fbResetRowImpl_(postId) {
+  const ss = findSheet_(SOCIAL_FOLDER, SOCIAL_FILE);
+  if (!ss) return { ok: false, error: "ไม่พบ Social Posts sheet" };
+  const sheet = ss.getSheetByName(SOCIAL_TAB);
+  if (!sheet) return { ok: false, error: "ไม่พบ tab " + SOCIAL_TAB };
+  const cols = scanSocialColumns_(sheet);
+  const lastRow = sheet.getLastRow();
+  if (cols.iId < 0 || lastRow < 2) return { ok: false, error: "queue ว่าง" };
+  const all = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  for (var i = 0; i < all.length; i++) {
+    if (String(all[i][cols.iId]) === postId) {
+      const sheetRow = i + 2;
+      if (cols.iStatus >= 0) sheet.getRange(sheetRow, cols.iStatus + 1).setValue("scheduled");
+      if (cols.iAttemptCount >= 0) sheet.getRange(sheetRow, cols.iAttemptCount + 1).setValue(0);
+      if (cols.iErrLog >= 0) sheet.getRange(sheetRow, cols.iErrLog + 1).setValue("");
+      if (cols.iErr >= 0) sheet.getRange(sheetRow, cols.iErr + 1).setValue("");
+      return { ok: true, post_id: postId };
+    }
+  }
+  return { ok: false, error: "ไม่พบ post_id: " + postId };
+}
+
+/**
+ * Publish to a Facebook Page. Three paths (priority: drive_id > image_url > text):
+ *   1. drive_id present → DriveApp.getFileById().getBlob() → multipart upload to /photos
+ *   2. image_url is HTTP(s) → FB crawls and attaches the URL
+ *   3. Neither → text-only post to /feed
+ */
+function publishToFb_(cfg, message, image_url, drive_id) {
+  if (drive_id) return publishPhotoFromDrive_(cfg, message, drive_id);
+  const isUrl = image_url && /^https?:\\/\\//i.test(image_url);
+  if (isUrl) return publishPhotoFromUrl_(cfg, message, image_url);
+  return publishText_(cfg, message);
+}
+
+function publishText_(cfg, message) {
+  const endpoint = "https://graph.facebook.com/v18.0/" + cfg.page_id + "/feed";
   const resp = UrlFetchApp.fetch(endpoint, {
     method: "post",
-    payload: payload,
+    payload: { access_token: cfg.page_token, message: message },
     muteHttpExceptions: true,
   });
+  return parsePostResponse_(resp);
+}
+
+function publishPhotoFromUrl_(cfg, message, image_url) {
+  const endpoint = "https://graph.facebook.com/v18.0/" + cfg.page_id + "/photos";
+  const resp = UrlFetchApp.fetch(endpoint, {
+    method: "post",
+    payload: { access_token: cfg.page_token, url: image_url, caption: message },
+    muteHttpExceptions: true,
+  });
+  return parsePostResponse_(resp);
+}
+
+function publishPhotoFromDrive_(cfg, message, drive_id) {
+  var blob;
+  try {
+    blob = DriveApp.getFileById(drive_id).getBlob();
+  } catch (e) {
+    throw new Error("Drive file ไม่พบ/เข้าถึงไม่ได้ (id=" + drive_id + "): " + e);
+  }
+  // UrlFetchApp encodes multipart/form-data when a Blob is included in payload
+  const endpoint = "https://graph.facebook.com/v18.0/" + cfg.page_id + "/photos";
+  const resp = UrlFetchApp.fetch(endpoint, {
+    method: "post",
+    payload: {
+      access_token: cfg.page_token,
+      caption: message,
+      source: blob,
+    },
+    muteHttpExceptions: true,
+  });
+  return parsePostResponse_(resp);
+}
+
+function parsePostResponse_(resp) {
   const code = resp.getResponseCode();
   const text = resp.getContentText();
   if (code < 200 || code >= 300) {
     throw new Error("HTTP " + code + ": " + text);
   }
   const data = JSON.parse(text);
-  // photos endpoint returns {id, post_id}; feed returns {id}
+  // /photos endpoint returns {id, post_id}; /feed returns {id}
   const postId = data.post_id || data.id;
   if (!postId) throw new Error("ไม่ได้ post_id กลับมา: " + text);
+  // post_id format: "PAGE_ID_POST_ID" → facebook.com/PAGE_ID/posts/POST_ID
   return "https://www.facebook.com/" + postId.replace("_", "/posts/");
 }
 `;

@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { REPO_ROOT } from "@/lib/repo";
-import { mimeForExt } from "../../list/route";
+import { mimeForExt } from "@/lib/mime";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

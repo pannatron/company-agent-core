@@ -33,10 +33,17 @@ interface DriveStatus {
   reason?: string;
 }
 
+interface SyncFileEntry {
+  file: string;
+  drive_id?: string;
+  url?: string;
+  reason?: string;
+}
+
 interface SyncResult {
-  uploaded: number;
-  updated: number;
-  skipped: number;
+  uploaded: SyncFileEntry[];
+  updated: SyncFileEntry[];
+  skipped: SyncFileEntry[];
   errors: { file: string; message: string }[];
 }
 
@@ -160,9 +167,9 @@ export default function FilesView() {
         setSyncResult(data as SyncResult);
       } else {
         setSyncResult({
-          uploaded: 0,
-          updated: 0,
-          skipped: 0,
+          uploaded: [],
+          updated: [],
+          skipped: [],
           errors: [{ file: "—", message: data.error || `HTTP ${res.status}` }],
         });
       }
@@ -417,20 +424,60 @@ function DrivePanel({
 
       {syncResult && (
         <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
-          <span className="pill pill-ok">
-            <span className="status-dot ok" />
-            +{syncResult.uploaded} ใหม่
+          <details className="inline-block">
+            <summary className="cursor-pointer">
+              <span className="pill pill-ok">
+                <span className="status-dot ok" />
+                +{syncResult.uploaded.length} ใหม่
+              </span>
+            </summary>
+            {syncResult.uploaded.length > 0 && (
+              <ul className="ml-1 mt-1 space-y-0.5 text-[10px] text-ink-dim">
+                {syncResult.uploaded.slice(0, 8).map((e, i) => (
+                  <li key={i}>
+                    <code>{e.file}</code>
+                    {e.drive_id && (
+                      <span className="opacity-60"> · {e.drive_id.slice(0, 10)}…</span>
+                    )}
+                  </li>
+                ))}
+                {syncResult.uploaded.length > 8 && (
+                  <li className="opacity-60">+{syncResult.uploaded.length - 8} อีก</li>
+                )}
+              </ul>
+            )}
+          </details>
+          <details className="inline-block">
+            <summary className="cursor-pointer">
+              <span
+                className="pill"
+                style={{
+                  background: "rgb(var(--accent-soft) / 0.15)",
+                  color: "rgb(var(--accent))",
+                }}
+              >
+                ↻ {syncResult.updated.length} อัปเดต
+              </span>
+            </summary>
+            {syncResult.updated.length > 0 && (
+              <ul className="ml-1 mt-1 space-y-0.5 text-[10px] text-ink-dim">
+                {syncResult.updated.slice(0, 8).map((e, i) => (
+                  <li key={i}>
+                    <code>{e.file}</code>
+                    {e.drive_id && (
+                      <span className="opacity-60"> · {e.drive_id.slice(0, 10)}…</span>
+                    )}
+                  </li>
+                ))}
+                {syncResult.updated.length > 8 && (
+                  <li className="opacity-60">+{syncResult.updated.length - 8} อีก</li>
+                )}
+              </ul>
+            )}
+          </details>
+          <span className="pill pill-muted">
+            ⤳ {syncResult.skipped.length} ข้าม
           </span>
-          <span
-            className="pill"
-            style={{
-              background: "rgb(var(--accent-soft) / 0.15)",
-              color: "rgb(var(--accent))",
-            }}
-          >
-            ↻ {syncResult.updated} อัปเดต
-          </span>
-          <span className="pill pill-muted">⤳ {syncResult.skipped} ข้าม</span>
           {syncResult.errors.length > 0 && (
             <details className="ml-2 inline-block">
               <summary className="cursor-pointer rounded-full bg-danger/15 px-2 py-0.5 text-[10px] font-medium text-danger">

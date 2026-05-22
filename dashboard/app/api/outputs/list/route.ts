@@ -4,6 +4,7 @@ import path from "node:path";
 import { REPO_ROOT } from "@/lib/repo";
 import { CATEGORIES, getCategory, MISC_CATEGORY } from "@/lib/categorizer";
 import { getSyncedMap } from "@/lib/driveSync";
+import { mimeForExt } from "@/lib/mime";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,7 +28,7 @@ export async function GET(req: NextRequest) {
       return {
         ...f,
         synced: !!synced,
-        web_link: synced?.web_link,
+        web_link: synced?.url,
       };
     })
     .sort((a, b) => b.mtime - a.mtime);
@@ -89,19 +90,3 @@ async function walk(root: string, dir: string): Promise<Entry[]> {
   return out;
 }
 
-export function mimeForExt(ext: string): string {
-  const map: Record<string, string> = {
-    ".md": "text/markdown; charset=utf-8",
-    ".txt": "text/plain; charset=utf-8",
-    ".json": "application/json; charset=utf-8",
-    ".csv": "text/csv; charset=utf-8",
-    ".pdf": "application/pdf",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-    ".html": "text/html; charset=utf-8",
-  };
-  return map[ext.toLowerCase()] || "application/octet-stream";
-}
