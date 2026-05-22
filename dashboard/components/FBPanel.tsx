@@ -88,8 +88,19 @@ export default function FBPanel({ refreshSignal }: Props) {
     try {
       const r = await fetch("/api/social/sheet/push", { method: "POST" });
       const d = await r.json();
-      if (!r.ok) setToast(`✗ ${d.error || `HTTP ${r.status}`}`);
-      else setToast(`✓ push ${d.rows} โพสต์ขึ้น Sheet`);
+      if (!r.ok) {
+        if (Array.isArray(d.issues) && d.issues.length > 0) {
+          const preview = (d.issues as { post_id: string; field: string; message: string }[])
+            .slice(0, 3)
+            .map((i) => `${i.post_id}.${i.field}: ${i.message}`)
+            .join(" · ");
+          const more =
+            d.issues.length > 3 ? ` (+${d.issues.length - 3} อีก)` : "";
+          setToast(`✗ schema invalid — ${preview}${more}`);
+        } else {
+          setToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+        }
+      } else setToast(`✓ push ${d.rows} โพสต์ขึ้น Sheet`);
     } finally {
       setBusy(null);
     }
@@ -231,6 +242,8 @@ export default function FBPanel({ refreshSignal }: Props) {
         </p>
       )}
 
+      {hasConfig && <CommentsInbox refreshSignal={refreshSignal} />}
+
       <SetupModal
         open={showSetup}
         status={status}
@@ -241,6 +254,299 @@ export default function FBPanel({ refreshSignal }: Props) {
         }}
       />
     </section>
+  );
+}
+
+/* ============================================================
+ *   Comments inbox (v9)
+ * ============================================================ */
+
+interface FbCommentRow {
+  comment_id: string;
+  fb_post_id: string;
+  local_post_id?: string;
+  from_name: string;
+  from_id?: string;
+  message: string;
+  created_at: string;
+  parent_comment_id?: string;
+  status: string;
+  reply_text?: string;
+  replied_at?: string;
+  replied_by?: string;
+  last_synced_at?: string;
+}
+
+function CommentsInbox({ refreshSignal }: { refreshSignal?: number }) {
+  const [comments, setComments] = useState<FbCommentRow[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [replyDraft, setReplyDraft] = useState<Record<string, string>>({});
+  const [filter, setFilter] = useState<"all" | "new" | "replied">("new");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await fetch("/api/social/fb/comments/list");
+      const d = (await r.json()) as { ok: boolean; comments?: FbCommentRow[] };
+      if (d.ok) setComments(d.comments ?? []);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load, refreshSignal]);
+
+  async function syncFromFb() {
+    setBusy("sync");
+    setToast(null);
+    try {
+      const r = await fetch("/api/social/fb/comments/sync", { method: "POST" });
+      const d = await r.json();
+      if (!r.ok) setToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+      else
+        setToast(
+          `✓ sync — new ${d.new_count}, polled ${d.polled} posts, รวม ${d.total}`,
+        );
+      await load();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function submitReply(comment_id: string) {
+    const msg = (replyDraft[comment_id] || "").trim();
+    if (!msg) {
+      setToast("กรอกข้อความตอบก่อน");
+      return;
+    }
+    setBusy(`reply:${comment_id}`);
+    setToast(null);
+    try {
+      const r = await fetch("/api/social/fb/comments/reply", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ comment_id, message: msg, replied_by: "user" }),
+      });
+      const d = await r.json();
+      if (!r.ok) setToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+      else {
+        setToast(`✓ ตอบแล้ว`);
+        setReplyDraft((s) => ({ ...s, [comment_id]: "" }));
+        setExpanded(null);
+        await load();
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteOne(comment_id: string) {
+    if (!confirm("ลบคอมเมนต์นี้บน Facebook? (ย้อนกลับไม่ได้)")) return;
+    setBusy(`del:${comment_id}`);
+    setToast(null);
+    try {
+      const r = await fetch("/api/social/fb/comments/delete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ comment_id, replied_by: "user" }),
+      });
+      const d = await r.json();
+      if (!r.ok) setToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+      else {
+        setToast("✓ ลบคอมเมนต์แล้ว");
+        await load();
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function ignoreOne(comment_id: string) {
+    setBusy(`ig:${comment_id}`);
+    setToast(null);
+    try {
+      const r = await fetch("/api/social/fb/comments/ignore", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ comment_id, replied_by: "user" }),
+      });
+      const d = await r.json();
+      if (!r.ok) setToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+      else {
+        setToast("✓ ทำเครื่องหมายว่าไม่ตอบ");
+        await load();
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const newCount = comments.filter((c) => c.status === "new").length;
+  const repliedCount = comments.filter((c) => c.status === "replied").length;
+  const filtered = comments
+    .filter((c) => filter === "all" || c.status === filter)
+    .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+
+  return (
+    <details className="mt-3 rounded-lg border border-border bg-surface-2/30 px-3 py-2 open:bg-surface-2/50">
+      <summary className="cursor-pointer text-xs text-ink-dim hover:text-ink">
+        💬 Comments inbox
+        {newCount > 0 && (
+          <span className="ml-2 rounded-full bg-rose-500/30 px-2 py-0.5 text-[10px] font-medium text-rose-200">
+            {newCount} ใหม่
+          </span>
+        )}
+        {repliedCount > 0 && (
+          <span className="ml-1 text-[10px] text-ink-dim/70">
+            · ตอบแล้ว {repliedCount}
+          </span>
+        )}
+      </summary>
+
+      <div className="mt-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1 text-[11px]">
+          {(["new", "replied", "all"] as const).map((k) => (
+            <button
+              key={k}
+              onClick={() => setFilter(k)}
+              className={`rounded px-2 py-0.5 ${
+                filter === k
+                  ? "bg-accent/20 text-ink"
+                  : "text-ink-dim hover:text-ink"
+              }`}
+            >
+              {k === "new" ? "ใหม่" : k === "replied" ? "ตอบแล้ว" : "ทั้งหมด"}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={syncFromFb}
+          disabled={!!busy}
+          className="rounded-md border border-border bg-surface px-2.5 py-1 text-[11px] text-ink-dim hover:border-accent hover:text-ink disabled:opacity-50"
+          title="ดึงคอมเมนต์ใหม่จาก Facebook"
+        >
+          {busy === "sync" ? "⟳…" : "⟳ ดึงจาก FB"}
+        </button>
+      </div>
+
+      {toast && (
+        <p
+          className={`mt-1 text-[11px] ${
+            toast.startsWith("✓") ? "text-emerald-300" : "text-rose-300"
+          }`}
+        >
+          {toast}
+        </p>
+      )}
+
+      <div className="mt-2 space-y-1.5">
+        {loading && (
+          <p className="text-[11px] text-ink-dim">กำลังโหลด…</p>
+        )}
+        {!loading && filtered.length === 0 && (
+          <p className="text-[11px] text-ink-dim">
+            {comments.length === 0
+              ? "ยังไม่มีคอมเมนต์ — กด ⟳ ดึงจาก FB"
+              : `ไม่มีคอมเมนต์ในหมวด "${filter === "new" ? "ใหม่" : filter === "replied" ? "ตอบแล้ว" : "ทั้งหมด"}"`}
+          </p>
+        )}
+        {filtered.map((c) => {
+          const isOpen = expanded === c.comment_id;
+          const dim = c.status === "replied" || c.status === "ignored" || c.status === "deleted";
+          return (
+            <div
+              key={c.comment_id}
+              className={`rounded border border-border bg-surface/40 px-2.5 py-1.5 text-[11.5px] ${
+                dim ? "opacity-60" : ""
+              }`}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <p className="text-ink">
+                    <strong>{c.from_name || "Unknown"}</strong>
+                    <span className="ml-2 text-[10px] text-ink-dim">
+                      {shortTime(c.created_at)}
+                    </span>
+                    {c.status !== "new" && (
+                      <span className="ml-2 rounded bg-surface-2 px-1 py-0.5 text-[9px] uppercase text-ink-dim">
+                        {c.status}
+                      </span>
+                    )}
+                  </p>
+                  <p className="mt-0.5 whitespace-pre-wrap break-words text-ink-dim">
+                    {c.message}
+                  </p>
+                  {c.reply_text && (
+                    <p className="mt-1 border-l-2 border-emerald-400/50 pl-2 text-[10.5px] text-emerald-200/80">
+                      ↳ {c.reply_text}
+                    </p>
+                  )}
+                </div>
+                <div className="flex shrink-0 flex-col items-end gap-1">
+                  {c.status === "new" && (
+                    <>
+                      <button
+                        onClick={() => setExpanded(isOpen ? null : c.comment_id)}
+                        className="rounded border border-border bg-surface px-1.5 py-0.5 text-[10px] text-ink-dim hover:border-accent hover:text-ink"
+                      >
+                        {isOpen ? "ปิด" : "↩ ตอบ"}
+                      </button>
+                      <button
+                        onClick={() => ignoreOne(c.comment_id)}
+                        disabled={!!busy}
+                        className="rounded border border-border bg-surface px-1.5 py-0.5 text-[10px] text-ink-dim hover:border-accent hover:text-ink disabled:opacity-50"
+                      >
+                        ข้าม
+                      </button>
+                    </>
+                  )}
+                  {c.status !== "deleted" && (
+                    <button
+                      onClick={() => deleteOne(c.comment_id)}
+                      disabled={!!busy}
+                      className="rounded border border-rose-500/40 bg-rose-500/10 px-1.5 py-0.5 text-[10px] text-rose-300 hover:border-rose-400 disabled:opacity-50"
+                    >
+                      🗑 ลบ
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {isOpen && (
+                <div className="mt-2">
+                  <textarea
+                    value={replyDraft[c.comment_id] ?? ""}
+                    onChange={(e) =>
+                      setReplyDraft((s) => ({
+                        ...s,
+                        [c.comment_id]: e.target.value,
+                      }))
+                    }
+                    placeholder="ตอบกลับ…"
+                    rows={2}
+                    className="input text-[11.5px]"
+                  />
+                  <div className="mt-1 flex justify-end gap-1">
+                    <button
+                      onClick={() => submitReply(c.comment_id)}
+                      disabled={busy === `reply:${c.comment_id}`}
+                      className="rounded border border-accent/50 bg-accent/15 px-2 py-0.5 text-[11px] text-ink hover:border-accent disabled:opacity-50"
+                    >
+                      {busy === `reply:${c.comment_id}` ? "ส่ง…" : "ส่งคำตอบ"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </details>
   );
 }
 

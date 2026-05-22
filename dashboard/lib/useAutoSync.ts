@@ -9,7 +9,9 @@ interface AutoSyncResult {
   outputs?: number;
   /** topics pushed to Sheets */
   sheets?: number;
-  errors: { source: "drive" | "sheets"; message: string }[];
+  /** rows pushed to the social-posts Sheet */
+  social?: number;
+  errors: { source: "drive" | "sheets" | "social"; message: string }[];
 }
 
 /**
@@ -51,23 +53,37 @@ export function useAutoSync() {
     const runId = ++runIdRef.current;
     setSyncing(true);
     try {
-      const [driveRes, sheetsRes] = await Promise.allSettled([
+      const [driveRes, sheetsRes, socialRes] = await Promise.allSettled([
         fetch("/api/drive/sync", { method: "POST" }).then((r) =>
           r.ok ? r.json() : r.json().then((j) => Promise.reject(j.error || `HTTP ${r.status}`)),
         ),
         fetch("/api/sheets/push", { method: "POST" }).then((r) =>
           r.ok ? r.json() : r.json().then((j) => Promise.reject(j.error || `HTTP ${r.status}`)),
         ),
+        // BUG-001 — push social-posts.json along with the CSV topics so agents
+        // never leave the Sheet stale after editing data/social-posts.json.
+        fetch("/api/social/sheet/push", { method: "POST" }).then((r) =>
+          r.ok
+            ? r.json()
+            : r.json().then((j) => {
+                const issues = Array.isArray(j.issues)
+                  ? ` (${j.issues.length} validation issue${j.issues.length === 1 ? "" : "s"})`
+                  : "";
+                return Promise.reject(`${j.error || `HTTP ${r.status}`}${issues}`);
+              }),
+        ),
       ]);
 
       const result: AutoSyncResult = { errors: [] };
       if (driveRes.status === "fulfilled") {
         const d = driveRes.value as {
-          uploaded?: number;
-          updated?: number;
+          uploaded?: number | unknown[];
+          updated?: number | unknown[];
           errors?: { file: string; message: string }[];
         };
-        result.outputs = (d.uploaded ?? 0) + (d.updated ?? 0);
+        const countOf = (v: number | unknown[] | undefined): number =>
+          Array.isArray(v) ? v.length : v ?? 0;
+        result.outputs = countOf(d.uploaded) + countOf(d.updated);
         for (const err of d.errors ?? []) {
           result.errors.push({ source: "drive", message: `${err.file}: ${err.message}` });
         }
@@ -86,6 +102,12 @@ export function useAutoSync() {
       } else {
         result.errors.push({ source: "sheets", message: String(sheetsRes.reason) });
       }
+      if (socialRes.status === "fulfilled") {
+        const s = socialRes.value as { rows?: number };
+        result.social = s.rows ?? 0;
+      } else {
+        result.errors.push({ source: "social", message: String(socialRes.reason) });
+      }
 
       // Discard if a newer sync already finished
       if (runId === runIdRef.current) setLastResult(result);
@@ -103,6 +125,7 @@ export function summarizeAutoSync(r: AutoSyncResult): string {
   const parts: string[] = [];
   if (r.outputs != null) parts.push(`Drive ${r.outputs}`);
   if (r.sheets != null) parts.push(`Sheets ${r.sheets}`);
+  if (r.social != null) parts.push(`Social ${r.social}`);
   let msg = `🔄 auto-sync: ${parts.join(" · ") || "ไม่มีไฟล์เปลี่ยน"}`;
   if (r.errors.length > 0) msg += ` (error ${r.errors.length})`;
   return msg;

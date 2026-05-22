@@ -5,7 +5,13 @@ import { ACCENT_BG_SOFT, EMPLOYEES, EmployeeMeta } from "@/lib/employees";
 import Avatar from "./Avatar";
 import FBPanel from "./FBPanel";
 
-type PostStatus = "draft" | "ready_for_review" | "approved" | "scheduled" | "published";
+type PostStatus =
+  | "draft"
+  | "ready_for_review"
+  | "approved"
+  | "scheduled"
+  | "published"
+  | "failed";
 
 interface Account {
   id: string;
@@ -38,6 +44,9 @@ interface Post {
   external_url?: string;
   campaign?: string;
   engagement?: Engagement | null;
+  last_attempt_at?: string;
+  attempt_count?: number;
+  error_log?: string;
 }
 
 interface SocialFile {
@@ -51,15 +60,24 @@ interface Props {
   onPromptCreatorTeam: () => void;
 }
 
+interface CardActions {
+  onPostNow: (postId: string) => Promise<void>;
+  onRetry: (postId: string) => Promise<void>;
+  busyPostId: string | null;
+}
+
 const COLUMNS: { key: PostStatus | "in_progress"; label: string; statuses: PostStatus[] }[] = [
   { key: "in_progress", label: "ร่าง / กำลังทำ", statuses: ["draft", "ready_for_review", "approved"] },
-  { key: "scheduled", label: "ตั้งเวลาแล้ว", statuses: ["scheduled"] },
+  { key: "scheduled", label: "ตั้งเวลาแล้ว", statuses: ["scheduled", "failed"] },
   { key: "published", label: "เผยแพร่แล้ว", statuses: ["published"] },
 ];
 
 export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props) {
   const [data, setData] = useState<SocialFile | null>(null);
   const [loading, setLoading] = useState(true);
+  const [localBump, setLocalBump] = useState(0);
+  const [busyPostId, setBusyPostId] = useState<string | null>(null);
+  const [actionToast, setActionToast] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -73,7 +91,54 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
     return () => {
       alive = false;
     };
-  }, [refreshSignal]);
+  }, [refreshSignal, localBump]);
+
+  const reload = () => setLocalBump((n) => n + 1);
+
+  const onPostNow = async (postId: string) => {
+    setBusyPostId(postId);
+    setActionToast(null);
+    try {
+      const r = await fetch("/api/social/fb/post-now", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ post_id: postId }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.ok === false) {
+        setActionToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+      } else {
+        setActionToast(`✓ โพสต์ขึ้น Facebook แล้ว — ${d.external_url || ""}`);
+        // Pull sheet back so local JSON reflects new status/external_url
+        await fetch("/api/social/sheet/pull", { method: "POST" }).catch(() => {});
+        reload();
+      }
+    } finally {
+      setBusyPostId(null);
+    }
+  };
+
+  const onRetry = async (postId: string) => {
+    setBusyPostId(postId);
+    setActionToast(null);
+    try {
+      const r = await fetch("/api/social/fb/retry", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ post_id: postId }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.ok === false) {
+        setActionToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+      } else {
+        setActionToast(`✓ reset เป็น scheduled — รอ trigger ถัดไป`);
+        await fetch("/api/social/sheet/pull", { method: "POST" }).catch(() => {});
+        reload();
+      }
+    } finally {
+      setBusyPostId(null);
+    }
+  };
 
   const grouped = useMemo(() => {
     const out = new Map<string, Post[]>();
@@ -113,9 +178,21 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
         </button>
       </header>
 
-      <FBPanel refreshSignal={refreshSignal} />
+      <FBPanel refreshSignal={refreshSignal + localBump} />
 
       {data && <AccountsStrip accounts={data.accounts} />}
+
+      {actionToast && (
+        <div
+          className={`border-b px-5 py-2 text-[11px] ${
+            actionToast.startsWith("✓")
+              ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-200"
+              : "border-rose-400/40 bg-rose-500/10 text-rose-200"
+          }`}
+        >
+          {actionToast}
+        </div>
+      )}
 
       <div className="flex-1 overflow-x-auto p-4">
         {isEmpty ? (
@@ -129,6 +206,7 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
                 key={col.key}
                 label={col.label}
                 posts={grouped.get(col.key) ?? []}
+                actions={{ onPostNow, onRetry, busyPostId }}
               />
             ))}
           </div>
@@ -168,7 +246,15 @@ function AccountsStrip({ accounts }: { accounts: Account[] }) {
   );
 }
 
-function Column({ label, posts }: { label: string; posts: Post[] }) {
+function Column({
+  label,
+  posts,
+  actions,
+}: {
+  label: string;
+  posts: Post[];
+  actions: CardActions;
+}) {
   return (
     <div className="flex w-[320px] shrink-0 flex-col rounded-xl border border-border bg-surface/40">
       <div className="flex items-center justify-between border-b border-border px-3 py-2">
@@ -185,14 +271,14 @@ function Column({ label, posts }: { label: string; posts: Post[] }) {
             ไม่มีโพสต์
           </p>
         ) : (
-          posts.map((p) => <PostCard key={p.id} post={p} />)
+          posts.map((p) => <PostCard key={p.id} post={p} actions={actions} />)
         )}
       </div>
     </div>
   );
 }
 
-function PostCard({ post }: { post: Post }) {
+function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
   const writer = EMPLOYEES.find((e) => e.slug === post.writer);
   const designer = EMPLOYEES.find((e) => e.slug === post.designer);
   const approver = EMPLOYEES.find((e) => e.slug === post.approved_by);
@@ -247,26 +333,65 @@ function PostCard({ post }: { post: Post }) {
         </div>
       )}
 
+      {post.error_log && (
+        <div
+          className="mt-2 rounded border border-rose-400/40 bg-rose-500/10 px-2 py-1.5 text-[10px] text-rose-200"
+          title={post.error_log}
+        >
+          <p className="font-medium">
+            🔴 ยิงไม่ออก{post.attempt_count ? ` · ลอง ${post.attempt_count} ครั้ง` : ""}
+          </p>
+          <p className="mt-0.5 line-clamp-2 opacity-80">{post.error_log}</p>
+          {post.last_attempt_at && (
+            <p className="mt-0.5 text-[9px] opacity-60">
+              ล่าสุด: {fmtDate(post.last_attempt_at)}
+            </p>
+          )}
+        </div>
+      )}
+
       <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/60 pt-1.5">
         <div className="flex -space-x-1.5">
           {writer && <Avatar employee={writer} size={18} />}
           {designer && <Avatar employee={designer} size={18} />}
           {approver && <Avatar employee={approver} size={18} />}
         </div>
-        {post.external_url ? (
-          <a
-            href={post.external_url}
-            target="_blank"
-            rel="noreferrer"
-            className="text-[10px] text-accent hover:underline"
-          >
-            เปิดโพสต์ ↗
-          </a>
-        ) : (
-          <span className="text-[10px] text-ink-dim/60">
-            {writer?.firstName || designer?.firstName || "—"}
-          </span>
-        )}
+        <div className="flex items-center gap-1.5">
+          {post.status === "scheduled" && (
+            <button
+              onClick={() => actions.onPostNow(post.id)}
+              disabled={actions.busyPostId === post.id}
+              className="rounded border border-accent/40 bg-accent/15 px-1.5 py-0.5 text-[10px] text-ink hover:border-accent disabled:opacity-50"
+              title="ยิงโพสต์เลย ไม่รอ scheduler"
+            >
+              {actions.busyPostId === post.id ? "…" : "▶ Post Now"}
+            </button>
+          )}
+          {post.status === "failed" && (
+            <button
+              onClick={() => actions.onRetry(post.id)}
+              disabled={actions.busyPostId === post.id}
+              className="rounded border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-200 hover:border-amber-300 disabled:opacity-50"
+              title="reset attempt_count + error_log แล้วให้ trigger ลองใหม่"
+            >
+              {actions.busyPostId === post.id ? "…" : "↻ Retry"}
+            </button>
+          )}
+          {post.external_url ? (
+            <a
+              href={post.external_url}
+              target="_blank"
+              rel="noreferrer"
+              className="text-[10px] text-accent hover:underline"
+            >
+              เปิดโพสต์ ↗
+            </a>
+          ) : (
+            <span className="text-[10px] text-ink-dim/60">
+              {writer?.firstName || designer?.firstName || "—"}
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -288,6 +413,7 @@ function StatusPill({ status }: { status: PostStatus }) {
     approved: { label: "approved", cls: "bg-cyan-500/15 text-cyan-200" },
     scheduled: { label: "scheduled", cls: "bg-violet-500/15 text-violet-200" },
     published: { label: "published", cls: "bg-emerald-500/15 text-emerald-200" },
+    failed: { label: "failed", cls: "bg-rose-500/20 text-rose-200" },
   };
   const m = map[status];
   return (

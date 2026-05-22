@@ -36,6 +36,7 @@ export const SOCIAL_HEADERS = [
   "copy",
   "asset_path",
   "asset_url",
+  "asset_drive_id",
   "external_url",
   "published_at",
   "engagement_likes",
@@ -48,7 +49,22 @@ export const SOCIAL_HEADERS = [
   "designer",
   "error",
   "notes",
+  // Diagnostics (BUG-003) — Apps Script writes back on every attempt
+  "last_attempt_at",
+  "attempt_count",
+  "error_log",
 ] as const;
+
+/** Statuses we recognise. Pushing an unknown status is rejected by the validator. */
+export const POST_STATUSES = [
+  "draft",
+  "ready_for_review",
+  "approved",
+  "scheduled",
+  "published",
+  "failed",
+] as const;
+export type PostStatus = (typeof POST_STATUSES)[number];
 
 interface Engagement {
   likes?: number;
@@ -64,8 +80,12 @@ interface Post {
   title?: string;
   copy?: string;
   asset_prompt?: string;
+  /** Local path to image, e.g., "outputs/content/launch-asset.jpg". Used to look up Drive file ID. */
   asset_file?: string;
+  /** External image URL (publicly accessible). If present, FB crawls this. */
   asset_url?: string;
+  /** Google Drive file ID (looked up from .drive-state.json by asset_file). Apps Script fetches blob + multipart upload. */
+  asset_drive_id?: string;
   designer?: string;
   writer?: string;
   approved_by?: string | null;
@@ -76,6 +96,68 @@ interface Post {
   engagement?: Engagement | null;
   error?: string;
   notes?: string;
+  /** ISO datetime of the most recent Apps Script attempt to publish (BUG-003) */
+  last_attempt_at?: string;
+  /** Count of attempts so far. Apps Script auto-fails the post once this reaches 3 (BUG-003) */
+  attempt_count?: number;
+  /** Last error message returned by Facebook / Apps Script (BUG-003) */
+  error_log?: string;
+}
+
+/* ---------- Drive state lookup for image posts ---------- */
+
+const DRIVE_STATE_PATH = path.join(DATA_DIR, ".drive-state.json");
+
+interface FileSyncEntry {
+  drive_id: string;
+  url: string;
+  synced_at: string;
+  size_at_sync: number;
+  category: string;
+}
+
+interface DriveState {
+  files: Record<string, FileSyncEntry>;
+}
+
+let driveStateCache: DriveState | null = null;
+
+async function loadDriveState(): Promise<DriveState> {
+  if (driveStateCache) return driveStateCache;
+  try {
+    const raw = await fs.readFile(DRIVE_STATE_PATH, "utf8");
+    driveStateCache = JSON.parse(raw) as DriveState;
+    return driveStateCache;
+  } catch {
+    driveStateCache = { files: {} };
+    return driveStateCache;
+  }
+}
+
+/** Reset cache so a fresh state file is read on next call (used between push runs). */
+function resetDriveStateCache(): void {
+  driveStateCache = null;
+}
+
+/**
+ * Look up Drive file ID for a local asset path.
+ *
+ * `assetFile` should be a path relative to the repo root, e.g.,
+ *   "outputs/content/launch-asset.jpg"
+ * The state file key is `<path>#<tag>` (tag="root" by default).
+ * If the file hasn't been Drive-synced yet, returns null.
+ */
+async function lookupDriveId(assetFile: string | undefined): Promise<string | null> {
+  if (!assetFile) return null;
+  const state = await loadDriveState();
+  // Try direct match first
+  const directKey = `${assetFile}#root`;
+  if (state.files[directKey]) return state.files[directKey].drive_id;
+  // Try any matching tag (by-person / by-month / etc.)
+  for (const [key, entry] of Object.entries(state.files)) {
+    if (key.startsWith(`${assetFile}#`)) return entry.drive_id;
+  }
+  return null;
 }
 
 interface Account {
@@ -113,30 +195,47 @@ async function writeSocialFile(data: SocialFile): Promise<void> {
   await fs.writeFile(SOCIAL_PATH, JSON.stringify(data, null, 2), "utf8");
 }
 
-/** Convert in-memory posts[] → CSV rows (parallel to SOCIAL_HEADERS). */
-export function postsToRows(posts: Post[]): string[][] {
-  return posts.map((p) => [
-    p.id ?? "",
-    p.platform ?? "",
-    p.status ?? "",
-    p.scheduled_at ?? "",
-    p.title ?? "",
-    p.copy ?? "",
-    p.asset_file ?? "",
-    p.asset_url ?? "",
-    p.external_url ?? "",
-    p.published_at ?? "",
-    String(p.engagement?.likes ?? ""),
-    String(p.engagement?.comments ?? ""),
-    String(p.engagement?.shares ?? ""),
-    String(p.engagement?.views ?? ""),
-    p.approved_by ?? "",
-    p.campaign ?? "",
-    p.writer ?? "",
-    p.designer ?? "",
-    p.error ?? "",
-    p.notes ?? "",
-  ]);
+/**
+ * Convert in-memory posts[] → CSV rows (parallel to SOCIAL_HEADERS).
+ *
+ * Async because we look up the Drive file ID for each post's `asset_file`
+ * from `.drive-state.json`. If the asset isn't yet on Drive, asset_drive_id
+ * is left blank and Apps Script falls back to URL/text-only.
+ */
+export async function postsToRows(posts: Post[]): Promise<string[][]> {
+  resetDriveStateCache(); // fresh state for each push
+  const rows: string[][] = [];
+  for (const p of posts) {
+    // Prefer explicitly-set asset_drive_id; otherwise look up by asset_file
+    const driveId = p.asset_drive_id || (await lookupDriveId(p.asset_file));
+    rows.push([
+      p.id ?? "",
+      p.platform ?? "",
+      p.status ?? "",
+      p.scheduled_at ?? "",
+      p.title ?? "",
+      p.copy ?? "",
+      p.asset_file ?? "",
+      p.asset_url ?? "",
+      driveId ?? "",
+      p.external_url ?? "",
+      p.published_at ?? "",
+      String(p.engagement?.likes ?? ""),
+      String(p.engagement?.comments ?? ""),
+      String(p.engagement?.shares ?? ""),
+      String(p.engagement?.views ?? ""),
+      p.approved_by ?? "",
+      p.campaign ?? "",
+      p.writer ?? "",
+      p.designer ?? "",
+      p.error ?? "",
+      p.notes ?? "",
+      p.last_attempt_at ?? "",
+      p.attempt_count != null ? String(p.attempt_count) : "",
+      p.error_log ?? "",
+    ]);
+  }
+  return rows;
 }
 
 /** Rebuild posts[] from Sheet rows. Unknown columns are ignored; missing columns become "". */
@@ -165,6 +264,7 @@ export function rowsToPosts(headers: string[], rows: string[][]): Post[] {
     if (comments != null) eng.comments = comments;
     if (shares != null) eng.shares = shares;
     if (views != null) eng.views = views;
+    const attemptCount = num(col(row, "attempt_count"));
     out.push({
       id,
       platform: col(row, "platform"),
@@ -174,6 +274,7 @@ export function rowsToPosts(headers: string[], rows: string[][]): Post[] {
       copy: col(row, "copy") || undefined,
       asset_file: col(row, "asset_path") || undefined,
       asset_url: col(row, "asset_url") || undefined,
+      asset_drive_id: col(row, "asset_drive_id") || undefined,
       external_url: col(row, "external_url") || undefined,
       published_at: col(row, "published_at") || undefined,
       engagement: Object.keys(eng).length ? eng : null,
@@ -183,9 +284,93 @@ export function rowsToPosts(headers: string[], rows: string[][]): Post[] {
       designer: col(row, "designer") || undefined,
       error: col(row, "error") || undefined,
       notes: col(row, "notes") || undefined,
+      last_attempt_at: col(row, "last_attempt_at") || undefined,
+      attempt_count: attemptCount,
+      error_log: col(row, "error_log") || undefined,
     });
   }
   return out;
+}
+
+/* ---------- Validation (BUG-002) ---------- */
+
+export interface ValidationIssue {
+  /** Post id (or "<post #N>" if id missing) */
+  post_id: string;
+  /** Field that failed, or "*" for whole-row issues */
+  field: string;
+  message: string;
+}
+
+/**
+ * Validate posts before pushing to Sheet. Catches the schema drift that
+ * silently breaks the auto-post pipeline (image posts missing asset_file,
+ * scheduled posts missing scheduled_at, unknown statuses, etc).
+ *
+ * Returns [] when everything is OK. The push API turns a non-empty list
+ * into a 400 response so the caller knows exactly what to fix.
+ */
+export function validatePosts(posts: Post[]): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const seenIds = new Set<string>();
+
+  posts.forEach((p, idx) => {
+    const ref = p.id || `<post #${idx + 1}>`;
+    if (!p.id) {
+      issues.push({ post_id: ref, field: "id", message: "id required" });
+    } else if (seenIds.has(p.id)) {
+      issues.push({ post_id: ref, field: "id", message: "duplicate id" });
+    } else {
+      seenIds.add(p.id);
+    }
+    if (!p.platform) {
+      issues.push({ post_id: ref, field: "platform", message: "platform required" });
+    }
+    if (!p.status) {
+      issues.push({ post_id: ref, field: "status", message: "status required" });
+    } else if (!(POST_STATUSES as readonly string[]).includes(p.status)) {
+      issues.push({
+        post_id: ref,
+        field: "status",
+        message: `unknown status "${p.status}" (expected one of ${POST_STATUSES.join(", ")})`,
+      });
+    }
+    if (!p.copy || !p.copy.trim()) {
+      issues.push({ post_id: ref, field: "copy", message: "copy required" });
+    }
+
+    if (p.status === "scheduled" || p.status === "published") {
+      if (!p.scheduled_at) {
+        issues.push({
+          post_id: ref,
+          field: "scheduled_at",
+          message: `scheduled_at required for status="${p.status}"`,
+        });
+      } else if (Number.isNaN(Date.parse(p.scheduled_at))) {
+        issues.push({
+          post_id: ref,
+          field: "scheduled_at",
+          message: `scheduled_at "${p.scheduled_at}" is not a valid ISO datetime`,
+        });
+      }
+    }
+
+    // Image post: if the designer left an asset_prompt OR the post is image-bearing
+    // (asset_url present), asset_file must point to a local file Drive can sync.
+    // This is the bug that bit us — agents created posts with asset_prompt but
+    // forgot asset_file, so Apps Script skipped them silently.
+    const looksLikeImagePost = !!p.asset_prompt || !!p.asset_url;
+    if (looksLikeImagePost && !p.asset_file && !p.asset_url) {
+      issues.push({
+        post_id: ref,
+        field: "asset_file",
+        message:
+          "image post needs asset_file (local path) or asset_url (public URL) — Apps Script will skip otherwise",
+      });
+    }
+  });
+
+  return issues;
 }
 
 /* ---------- Public push / pull ---------- */
@@ -229,14 +414,30 @@ interface ReadSheetResponse {
   error?: string;
 }
 
-/** Read social-posts.json → push posts[] into Sheets. */
+/** Thrown by pushSocialPosts when validation fails. Push route turns this into 400. */
+export class SocialPostValidationError extends Error {
+  issues: ValidationIssue[];
+  constructor(issues: ValidationIssue[]) {
+    super(
+      `social-posts.json validation failed (${issues.length} issue${issues.length === 1 ? "" : "s"})`,
+    );
+    this.name = "SocialPostValidationError";
+    this.issues = issues;
+  }
+}
+
+/** Read social-posts.json → validate → push posts[] into Sheets. */
 export async function pushSocialPosts(): Promise<{
   rows: number;
   workbook_url?: string;
 }> {
   const url = await loadDriveUrl();
   const data = await readSocialFile();
-  const rows = postsToRows(data.posts);
+  const issues = validatePosts(data.posts);
+  if (issues.length > 0) {
+    throw new SocialPostValidationError(issues);
+  }
+  const rows = await postsToRows(data.posts);
   const r = await callScript<WriteSheetResponse>(url, {
     action: "write_sheet",
     folder_path: SOCIAL_TOPIC.folder,
