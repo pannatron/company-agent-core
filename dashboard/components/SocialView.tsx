@@ -95,6 +95,43 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
 
   const reload = () => setLocalBump((n) => n + 1);
 
+  // BUG-007: Apps Script publishes scheduled posts on its own (every 5 min)
+  // and writes status=published back to the Sheet, but the dashboard never
+  // saw the update because we only pulled on user action. Poll the Sheet
+  // every 45s while this tab is open AND there's at least one scheduled
+  // post — stop polling once everything is resolved so we don't hammer
+  // Apps Script needlessly.
+  useEffect(() => {
+    if (!data) return;
+    const hasPending = data.posts.some(
+      (p) => p.status === "scheduled" || p.status === "failed",
+    );
+    if (!hasPending) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      if (cancelled || document.hidden) {
+        timer = setTimeout(tick, 45_000);
+        return;
+      }
+      try {
+        const r = await fetch("/api/social/sheet/pull", { method: "POST" });
+        if (!cancelled && r.ok) reload();
+      } catch {
+        /* transient — just try again next tick */
+      } finally {
+        if (!cancelled) timer = setTimeout(tick, 45_000);
+      }
+    };
+    timer = setTimeout(tick, 45_000);
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [data]);
+
   const onPostNow = async (postId: string) => {
     setBusyPostId(postId);
     setActionToast(null);

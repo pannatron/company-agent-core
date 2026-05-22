@@ -76,10 +76,16 @@ export default function ChatPane({ employee }: Props) {
   const [outputs, setOutputs] = useState<OutputFile[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   const [confirmingClear, setConfirmingClear] = useState(false);
-  // Pagination — render only the last N messages to keep the DOM small. Old
-  // messages are still in `messages` state (used by send() to pass full
-  // history to the API); we just don't mount their bubbles.
+  // Pagination — two layers:
+  //  1. DOM cap: render only the last `displayCount` messages so the bubble
+  //     list stays small regardless of state size.
+  //  2. Server pagination: on mount we only fetch the last 60 messages;
+  //     `hasMore` + `oldestTimestamp` let us page back into the gzipped
+  //     archive when the user scrolls up past what we've loaded.
   const [displayCount, setDisplayCount] = useState(30);
+  const [hasMore, setHasMore] = useState(false);
+  const [oldestTimestamp, setOldestTimestamp] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const autoSync = useAutoSync();
   const endRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -93,20 +99,56 @@ export default function ChatPane({ employee }: Props) {
     setSessionStart(Date.now());
     setOutputs([]);
     setMessages([]);
-    setDisplayCount(10);
+    setDisplayCount(30);
+    setHasMore(false);
+    setOldestTimestamp(null);
 
     let alive = true;
-    fetch(`/api/chats/${chatId}`)
+    fetch(`/api/chats/${chatId}?limit=60`)
       .then((r) => r.json())
-      .then((rec: { messages?: PersistedChatMsg[] } | null) => {
+      .then((rec: PaginatedChat | null) => {
         if (!alive || !rec?.messages) return;
         setMessages(rec.messages.map(hydratePersistedMsg));
+        setHasMore(Boolean(rec.has_more));
+        if (rec.messages.length > 0) {
+          setOldestTimestamp(rec.messages[0].timestamp ?? null);
+        }
       })
       .catch(() => {});
     return () => {
       alive = false;
     };
   }, [employee.slug, chatId]);
+
+  async function loadOlder() {
+    // First exhaust messages we already have in state.
+    if (displayCount < messages.length) {
+      setDisplayCount((c) => Math.min(c + 20, messages.length));
+      return;
+    }
+    if (loadingOlder || !hasMore || !oldestTimestamp) return;
+    setLoadingOlder(true);
+    try {
+      const res = await fetch(
+        `/api/chats/${chatId}?limit=60&before=${encodeURIComponent(oldestTimestamp)}`,
+      );
+      const data = (await res.json()) as PaginatedChat;
+      const older = (data.messages ?? []).map(hydratePersistedMsg);
+      if (older.length === 0) {
+        setHasMore(false);
+        return;
+      }
+      setMessages((curr) => [...older, ...curr]);
+      setHasMore(Boolean(data.has_more));
+      const newOldest = data.messages?.[0]?.timestamp;
+      if (newOldest) setOldestTimestamp(newOldest);
+      setDisplayCount((c) => c + older.length);
+    } catch {
+      /* swallow; user can retry */
+    } finally {
+      setLoadingOlder(false);
+    }
+  }
 
   useEffect(() => {
     if (!toast) return;
@@ -435,14 +477,17 @@ export default function ChatPane({ employee }: Props) {
         )}
 
         <div className="mx-auto flex max-w-3xl flex-col gap-4">
-          {messages.length > displayCount && (
+          {(messages.length > displayCount || hasMore) && (
             <button
-              onClick={() =>
-                setDisplayCount((c) => Math.min(c + 10, messages.length))
-              }
-              className="self-center rounded-full border border-border bg-surface px-4 py-1.5 text-[11px] text-ink-dim hover:border-accent hover:text-ink"
+              onClick={loadOlder}
+              disabled={loadingOlder}
+              className="self-center rounded-full border border-border bg-surface px-4 py-1.5 text-[11px] text-ink-dim hover:border-accent hover:text-ink disabled:opacity-50"
             >
-              ↑ โหลดข้อความเก่ากว่า ({messages.length - displayCount} ที่เหลือ)
+              {loadingOlder
+                ? "กำลังโหลด…"
+                : messages.length > displayCount
+                  ? `↑ โหลดข้อความเก่ากว่า (${messages.length - displayCount} ในหน่วยความจำ)`
+                  : "↑ โหลดข้อความเก่ากว่าจาก archive"}
             </button>
           )}
           {messages.slice(-displayCount).map((m, i) => {
@@ -952,6 +997,14 @@ interface PersistedChatMsg {
   blocks?: AssistantBlock[];
   status?: "done" | "error";
   durationMs?: number;
+  /** ISO timestamp — used by server pagination's `before=` cursor. */
+  timestamp?: string;
+}
+
+interface PaginatedChat {
+  messages?: PersistedChatMsg[];
+  has_more?: boolean;
+  message_count?: number;
 }
 
 function hydratePersistedMsg(m: PersistedChatMsg): Message {

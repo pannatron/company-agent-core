@@ -1,8 +1,20 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+/**
+ * Meeting room = dispatch board (not a chat log).
+ *
+ * User types a request → server picks the right employee → SDK iteration runs
+ * in the background and persists into `direct-<slug>` (the employee's own
+ * room). The meeting room only shows a compact "task card" per dispatch:
+ * who took it, what they were asked, a status pill (กำลังคิด / เสร็จแล้ว /
+ * error) and a short result preview. The input stays enabled so the user can
+ * fire the next task to a different employee without waiting.
+ *
+ * Detailed thinking / tool calls / full reply live in the employee's direct
+ * chat — click "เปิดห้อง" on a card to jump there.
+ */
+
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ACCENT_BG_SOFT,
   ACCENT_BORDER,
@@ -11,6 +23,7 @@ import {
   EmployeeSlug,
 } from "@/lib/employees";
 import { summarizeAutoSync, useAutoSync } from "@/lib/useAutoSync";
+import { useJobStream, abortJob, type ClientJob } from "@/lib/useJobStream";
 import Avatar from "./Avatar";
 import MentionTextarea from "./MentionTextarea";
 
@@ -28,45 +41,28 @@ interface Respondent {
   title: string;
   department: string;
   accent: EmployeeMeta["accent"];
-  avatarUrl: string;
+  avatarUrl?: string;
   reason: string;
 }
 
-type Block =
-  | { kind: "text"; text: string }
-  | { kind: "thinking"; text: string }
-  | {
-      kind: "tool";
-      id: string;
-      name: string;
-      summary: string;
-      status: "running" | "ok" | "error";
-      preview?: string;
-    };
-
-/** A file the agent created during the turn — surfaced as an inline preview. */
-interface GeneratedFile {
-  path: string;
-  name: string;
-  mimeType: string;
-  size: number;
+/** A dispatched task — purely client-side state, hydrated from /api/jobs/stream. */
+interface Task {
+  jobId: string;
+  prompt: string;
+  attachments?: Attachment[];
+  respondent: Respondent;
+  /** Hint from POST /api/chat — overridden by job stream once it arrives. */
+  initialStatus: "queued";
+  /** ISO seconds when we dispatched (used while jobStream snapshot loads). */
+  dispatchedAt: number;
 }
 
-type Msg =
-  | {
-      role: "user";
-      content: string;
-      attachments?: Attachment[];
-      seedPrompt?: string;
-    }
-  | {
-      role: "assistant";
-      respondent: Respondent | null;
-      blocks: Block[];
-      status: "streaming" | "done" | "error";
-      durationMs?: number;
-      generatedFiles?: GeneratedFile[];
-    };
+interface DispatchResponse {
+  ok: boolean;
+  job_id: string;
+  chat_id: string;
+  respondent: Respondent;
+}
 
 interface Props {
   /** Optional seed prompt: when changed, autofill input */
@@ -75,49 +71,149 @@ interface Props {
   onRespondent: (slug: EmployeeSlug | null) => void;
   /** Notify parent when agent likely changed tasks.json (so kanban re-fetches) */
   onAgentTurn: () => void;
+  /** Jump to a direct chat room (used by "เปิดห้อง" button on task cards). */
+  onOpenDirect: (slug: EmployeeSlug) => void;
 }
 
-const CHAT_ID = "meeting-room";
+const LS_TASK_ORDER = "meeting-room.dispatched-job-ids";
 
-export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) {
-  const [messages, setMessages] = useState<Msg[]>([]);
+export default function MeetingRoom({
+  seed,
+  onRespondent,
+  onAgentTurn,
+  onOpenDirect,
+}: Props) {
+  const [tasks, setTasks] = useState<Task[]>([]);
   const [input, setInput] = useState("");
   const [pendingFiles, setPendingFiles] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
-  const [streaming, setStreaming] = useState(false);
+  const [dispatching, setDispatching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const [confirmingClear, setConfirmingClear] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
   const autoSync = useAutoSync();
 
-  // Load any persisted conversation on mount (and after employee/tab switches)
+  // Subscribe to global job stream so each task card animates live.
+  const { all: jobsList } = useJobStream();
+  const jobsById = useMemo(() => {
+    const m = new Map<string, ClientJob>();
+    for (const j of jobsList) m.set(j.id, j);
+    return m;
+  }, [jobsList]);
+
+  // Hydrate task order from localStorage on mount so a page refresh doesn't
+  // wipe the board. We only persist ids — the rest comes from job stream.
   useEffect(() => {
-    let alive = true;
-    fetch(`/api/chats/${CHAT_ID}`)
-      .then((r) => r.json())
-      .then((rec: { messages?: PersistedMsg[] } | null) => {
-        if (!alive || !rec?.messages) return;
-        setMessages(rec.messages.map(hydrateMsg));
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
+    try {
+      const raw = localStorage.getItem(LS_TASK_ORDER);
+      if (!raw) return;
+      const ids = JSON.parse(raw) as string[];
+      if (!Array.isArray(ids)) return;
+      // Re-hydrate skeleton tasks; real data will fill in once snapshot arrives.
+      setTasks((cur) => {
+        if (cur.length > 0) return cur; // already populated
+        return ids.map<Task>((id) => ({
+          jobId: id,
+          prompt: "(โหลด…)",
+          respondent: PLACEHOLDER_RESPONDENT,
+          initialStatus: "queued",
+          dispatchedAt: 0,
+        }));
+      });
+    } catch {
+      /* ignore */
+    }
   }, []);
 
-  // Apply seeded prompt from outside
+  // Persist task order whenever it changes.
   useEffect(() => {
-    if (seed && !streaming) {
-      setInput(seed);
+    try {
+      const ids = tasks.map((t) => t.jobId);
+      localStorage.setItem(LS_TASK_ORDER, JSON.stringify(ids.slice(-50)));
+    } catch {
+      /* ignore */
     }
-  }, [seed, streaming]);
+  }, [tasks]);
+
+  // Once a task's job arrives from snapshot, backfill its prompt/respondent if
+  // we only had a placeholder (e.g. after page refresh). Crucially, we bail
+  // out by returning the same `cur` reference when nothing changed —
+  // otherwise `cur.map()` would mint a fresh array every render and create
+  // an infinite loop with `jobsById`'s identity churn.
+  useEffect(() => {
+    setTasks((cur) => {
+      let changed = false;
+      const next = cur.map((t) => {
+        if (t.respondent !== PLACEHOLDER_RESPONDENT) return t;
+        const j = jobsById.get(t.jobId);
+        if (!j) return t;
+        changed = true;
+        return {
+          ...t,
+          prompt: j.prompt,
+          respondent: {
+            slug: j.employeeSlug as EmployeeSlug,
+            name: j.employeeName,
+            title: "",
+            department: "",
+            accent: (j.employeeAccent as EmployeeMeta["accent"]) || "indigo",
+            reason: "",
+          },
+          dispatchedAt: j.startedAt,
+        };
+      });
+      return changed ? next : cur;
+    });
+  }, [jobsById]);
+
+  // Surface "currently working" respondent to sidebar spotlight (most recent
+  // running task wins). Notify "no one" once everything is idle.
+  useEffect(() => {
+    const running = [...tasks]
+      .reverse()
+      .map((t) => jobsById.get(t.jobId))
+      .find((j) => j && (j.status === "running" || j.status === "queued"));
+    onRespondent(running ? (running.employeeSlug as EmployeeSlug) : null);
+  }, [tasks, jobsById, onRespondent]);
+
+  // When any of our tasks just finished, refresh KPI/task-board for the parent.
+  const prevStatusesRef = useRef<Map<string, string>>(new Map());
+  useEffect(() => {
+    let changed = false;
+    const next = new Map<string, string>();
+    for (const t of tasks) {
+      const j = jobsById.get(t.jobId);
+      const status = j?.status ?? "queued";
+      next.set(t.jobId, status);
+      const prev = prevStatusesRef.current.get(t.jobId);
+      if (
+        prev &&
+        (prev === "running" || prev === "queued") &&
+        status !== "running" &&
+        status !== "queued"
+      ) {
+        changed = true;
+      }
+    }
+    prevStatusesRef.current = next;
+    if (changed) {
+      onAgentTurn();
+      if (autoSync.enabled) {
+        autoSync.runSync().then((r) => {
+          if (r) setToast(summarizeAutoSync(r));
+        });
+      }
+    }
+  }, [tasks, jobsById, onAgentTurn, autoSync]);
+
+  useEffect(() => {
+    if (seed && !dispatching) setInput(seed);
+  }, [seed, dispatching]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, streaming]);
+  }, [tasks.length]);
 
   useEffect(() => {
     if (!toast) return;
@@ -152,105 +248,16 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
     setPendingFiles((c) => c.filter((f) => f.path !== p));
   }
 
-  function updateLast(updater: (m: Extract<Msg, { role: "assistant" }>) => Extract<Msg, { role: "assistant" }>) {
-    setMessages((curr) => {
-      const copy = [...curr];
-      for (let i = copy.length - 1; i >= 0; i--) {
-        if (copy[i].role === "assistant") {
-          copy[i] = updater(copy[i] as Extract<Msg, { role: "assistant" }>);
-          return copy;
-        }
-      }
-      return copy;
-    });
-  }
-
-  function handleEvent(evt: Record<string, unknown>) {
-    const t = evt.type as string;
-    if (t === "respondent") {
-      const r: Respondent = {
-        slug: String(evt.slug ?? "ceo") as EmployeeSlug,
-        name: String(evt.name ?? ""),
-        title: String(evt.title ?? ""),
-        department: String(evt.department ?? ""),
-        accent: String(evt.accent ?? "indigo") as EmployeeMeta["accent"],
-        avatarUrl: String(evt.avatarUrl ?? ""),
-        reason: String(evt.reason ?? ""),
-      };
-      onRespondent(r.slug);
-      updateLast((m) => ({ ...m, respondent: r }));
-    } else if (t === "text") {
-      updateLast((m) => ({ ...m, blocks: appendText(m.blocks, String(evt.text ?? "")) }));
-    } else if (t === "thinking") {
-      updateLast((m) => ({ ...m, blocks: appendThinking(m.blocks, String(evt.text ?? "")) }));
-    } else if (t === "tool_use") {
-      const block: Block = {
-        kind: "tool",
-        id: String(evt.id ?? ""),
-        name: String(evt.name ?? "tool"),
-        summary: String(evt.summary ?? ""),
-        status: "running",
-      };
-      updateLast((m) => ({ ...m, blocks: [...m.blocks, block] }));
-    } else if (t === "tool_result") {
-      const id = String(evt.id ?? "");
-      const ok = Boolean(evt.ok);
-      const preview = String(evt.preview ?? "");
-      updateLast((m) => ({
-        ...m,
-        blocks: m.blocks.map((b) =>
-          b.kind === "tool" && b.id === id
-            ? { ...b, status: ok ? "ok" : "error", preview }
-            : b,
-        ),
-      }));
-    } else if (t === "done") {
-      updateLast((m) => ({
-        ...m,
-        status: evt.error ? "error" : "done",
-        durationMs: typeof evt.duration_ms === "number" ? evt.duration_ms : undefined,
-      }));
-    } else if (t === "error") {
-      setError(String(evt.message ?? "unknown error"));
-      updateLast((m) => ({ ...m, status: "error" }));
-    }
-  }
-
-  async function send() {
-    const text = input.trim();
-    if ((!text && pendingFiles.length === 0) || streaming) return;
+  async function dispatch(overrideText?: string) {
+    const text = (overrideText ?? input).trim();
+    if (!text && pendingFiles.length === 0) return;
 
     setError(null);
     const attached = pendingFiles;
-    const next: Msg[] = [
-      ...messages,
-      {
-        role: "user",
-        content: text || "(แนบไฟล์มา — ช่วยดูให้ที)",
-        attachments: attached,
-      },
-      {
-        role: "assistant",
-        respondent: null,
-        blocks: [],
-        status: "streaming",
-      },
-    ];
-    setMessages(next);
+
+    setDispatching(true);
     setInput("");
     setPendingFiles([]);
-    setStreaming(true);
-
-    const turnStartAt = Date.now();
-    const ac = new AbortController();
-    abortRef.current = ac;
-
-    // Last assistant who actually replied — used by chat route for sticky
-    // routing so the speaker doesn't ping-pong on every message
-    const lastAssistant = [...messages]
-      .reverse()
-      .find((m): m is Extract<Msg, { role: "assistant" }> => m.role === "assistant");
-    const lastRespondent = lastAssistant?.respondent?.slug;
 
     try {
       const res = await fetch("/api/chat", {
@@ -258,126 +265,51 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           employee: "auto",
-          last_respondent: lastRespondent,
-          messages: next
-            .slice(0, -1)
-            .map((m) =>
-              m.role === "user"
-                ? { role: "user" as const, content: m.content }
-                : {
-                    role: "assistant" as const,
-                    content: blocksToText(m.blocks),
-                  },
-            ),
+          dispatch: true,
+          // No `last_respondent` here on purpose. The dispatch board treats each
+          // task as independent — routing must be fresh per prompt (keyword +
+          // explicit @mention), not "continue with whoever spoke last". The
+          // sticky hint is only useful inside a 1-on-1 thread (ChatPane).
+          messages: [{ role: "user" as const, content: text || "(แนบไฟล์มา — ช่วยดูให้ที)" }],
           attachments: attached.map((a) => ({
             path: a.path,
             name: a.name,
             mimeType: a.mimeType,
           })),
         }),
-        signal: ac.signal,
       });
 
-      if (!res.ok || !res.body) {
-        const errPayload = await res.json().catch(() => ({}));
-        throw new Error(errPayload.error || `HTTP ${res.status}`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${res.status}`);
       }
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            handleEvent(JSON.parse(line));
-          } catch {
-            /* ignore */
-          }
-        }
-      }
-      if (buffer.trim()) {
-        try {
-          handleEvent(JSON.parse(buffer));
-        } catch {
-          /* ignore */
-        }
-      }
+      const data = (await res.json()) as DispatchResponse;
+      const task: Task = {
+        jobId: data.job_id,
+        prompt: text || "(แนบไฟล์มา — ช่วยดูให้ที)",
+        attachments: attached.length > 0 ? attached : undefined,
+        respondent: data.respondent,
+        initialStatus: "queued",
+        dispatchedAt: Date.now(),
+      };
+      setTasks((cur) => [...cur, task]);
     } catch (e) {
-      if ((e as Error).name !== "AbortError") {
-        setError((e as Error).message);
-        updateLast((m) => ({ ...m, status: "error" }));
-      }
+      setError((e as Error).message);
+      // restore input so user can retry without retyping
+      setInput(text);
+      setPendingFiles(attached);
     } finally {
-      setStreaming(false);
-      abortRef.current = null;
-      onRespondent(null);
-      onAgentTurn();
-      // Find images the agent created during this turn and attach as inline previews
-      try {
-        const res = await fetch(
-          `/api/outputs/list?since=${turnStartAt}&includeUploads=0`,
-        );
-        if (res.ok) {
-          const data = (await res.json()) as { files: GeneratedFile[] };
-          const images = data.files.filter((f) => f.mimeType.startsWith("image/"));
-          if (images.length > 0) {
-            updateLast((m) => ({ ...m, generatedFiles: images }));
-          }
-        }
-      } catch {
-        /* ignore — preview is best-effort */
-      }
-      // Auto-sync to Drive + Sheets if user has the toggle on
-      if (autoSync.enabled) {
-        const r = await autoSync.runSync();
-        if (r) setToast(summarizeAutoSync(r));
-      }
+      setDispatching(false);
     }
   }
 
-  function stop() {
-    abortRef.current?.abort();
-  }
-
-  async function saveTranscript() {
-    if (messages.length === 0) {
-      setToast("ยังไม่มีบทสนทนาให้บันทึก");
-      return;
-    }
+  function clearBoard() {
+    setTasks([]);
     try {
-      const res = await fetch(`/api/chats/${CHAT_ID}/dump`, { method: "POST" });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        setToast(data.error || `บันทึกไม่สำเร็จ`);
-        return;
-      }
-      setToast(`✓ บันทึก ${data.path}  —  Sync now ที่แท็บ Files เพื่ออัปขึ้น Drive`);
-    } catch (e) {
-      setToast((e as Error).message);
-    }
-  }
-
-  async function clearChat() {
-    if (!confirmingClear) {
-      setConfirmingClear(true);
-      setTimeout(() => setConfirmingClear(false), 3500);
-      return;
-    }
-    setConfirmingClear(false);
-    try {
-      await fetch(`/api/chats/${CHAT_ID}`, { method: "DELETE" });
-      setMessages([]);
-      setError(null);
-      onRespondent(null);
-      setToast("✓ ล้างแชทเรียบร้อย  —  ไฟล์ที่บันทึกไว้ใน outputs/chats/ ยังอยู่");
-    } catch (e) {
-      setToast((e as Error).message);
+      localStorage.removeItem(LS_TASK_ORDER);
+    } catch {
+      /* ignore */
     }
   }
 
@@ -386,12 +318,20 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
       <div className="flex items-center justify-between gap-2 border-b border-border bg-surface/40 px-5 py-2">
         <div className="flex items-center gap-2 text-[11px] text-ink-dim">
           <span className="status-dot ok" />
-          <span>บันทึกอัตโนมัติ · {messages.length} ข้อความ</span>
+          <span>
+            บอร์ดสั่งงาน · {tasks.length} task{tasks.length !== 1 ? "s" : ""}
+            {tasks.length > 0 && (
+              <>
+                {" · "}
+                <ActiveCounter tasks={tasks} jobsById={jobsById} />
+              </>
+            )}
+          </span>
         </div>
         <div className="flex items-center gap-1.5">
           <label
             className="flex cursor-pointer select-none items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-[11px] text-ink-dim hover:border-accent hover:text-ink"
-            title="หลังจากเอเจ้นต์ตอบเสร็จ จะอัปไฟล์ใน outputs/ ขึ้น Drive และ push CSV ขึ้น Sheets อัตโนมัติ"
+            title="หลังจากเอเจ้นต์ทำงานเสร็จ จะอัปไฟล์ใน outputs/ ขึ้น Drive และ push CSV ขึ้น Sheets อัตโนมัติ"
           >
             <input
               type="checkbox"
@@ -399,30 +339,15 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
               onChange={autoSync.toggle}
               className="h-3 w-3 accent-indigo-500"
             />
-            <span>
-              {autoSync.syncing ? "🔄 sync…" : "🔄 auto-sync"}
-            </span>
+            <span>{autoSync.syncing ? "🔄 sync…" : "🔄 auto-sync"}</span>
           </label>
           <button
-            onClick={saveTranscript}
-            disabled={messages.length === 0 || streaming}
-            title="บันทึกบทสนทนาเป็น markdown ลง outputs/chats/ → ดูได้ใน Files tab (sync Drive ได้)"
+            onClick={clearBoard}
+            disabled={tasks.length === 0}
+            title="ล้างบอร์ด (รายละเอียดแชทในห้องย่อยของแต่ละคนยังอยู่)"
             className="rounded-md border border-border bg-surface px-2.5 py-1 text-[11px] text-ink-dim hover:border-accent hover:text-ink disabled:opacity-30"
           >
-            💾 บันทึก
-          </button>
-          <button
-            onClick={clearChat}
-            disabled={messages.length === 0 || streaming}
-            title="ลบบทสนทนาทั้งหมด (ไฟล์ที่บันทึกไว้ใน outputs/chats/ ไม่ถูกลบ)"
-            className={[
-              "rounded-md border px-2.5 py-1 text-[11px] disabled:opacity-30",
-              confirmingClear
-                ? "border-danger bg-danger/10 text-danger"
-                : "border-border bg-surface text-ink-dim hover:border-danger hover:text-danger",
-            ].join(" ")}
-          >
-            {confirmingClear ? "ยืนยันลบ?" : "🗑 ล้างแชท"}
+            🗑 ล้างบอร์ด
           </button>
         </div>
       </div>
@@ -434,21 +359,18 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
       )}
 
       <div className="flex-1 overflow-y-auto px-6 py-5">
-        {messages.length === 0 && !streaming && (
-          <EmptyMeetingRoom onPick={(q) => setInput(q)} />
+        {tasks.length === 0 && (
+          <EmptyBoard onPick={(q) => setInput(q)} />
         )}
-        <div className="mx-auto flex max-w-3xl flex-col gap-4">
-          {messages.map((m, i) =>
-            m.role === "user" ? (
-              <UserBubble key={i} message={m} />
-            ) : (
-              <AssistantBubble
-                key={i}
-                message={m}
-                streaming={streaming && i === messages.length - 1}
-              />
-            ),
-          )}
+        <div className="mx-auto flex max-w-3xl flex-col gap-3">
+          {tasks.map((t) => (
+            <TaskCard
+              key={t.jobId}
+              task={t}
+              job={jobsById.get(t.jobId)}
+              onOpenDirect={onOpenDirect}
+            />
+          ))}
           {error && (
             <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
               {error}
@@ -471,6 +393,15 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
               ))}
             </div>
           )}
+          <AgentPickerBar
+            input={input}
+            disabled={uploading}
+            onPing={(firstName) => {
+              const trimmed = input.trim();
+              const composed = trimmed ? `@${firstName} ${trimmed}` : `@${firstName}`;
+              dispatch(composed);
+            }}
+          />
           <div className="flex items-end gap-2">
             <input
               ref={fileRef}
@@ -482,7 +413,7 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
             />
             <button
               onClick={() => fileRef.current?.click()}
-              disabled={uploading || streaming}
+              disabled={uploading}
               title="แนบไฟล์"
               className="flex h-[52px] items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-3 text-sm text-ink-dim hover:border-accent hover:text-ink disabled:opacity-50"
             >
@@ -491,228 +422,279 @@ export default function MeetingRoom({ seed, onRespondent, onAgentTurn }: Props) 
             <MentionTextarea
               value={input}
               onChange={setInput}
-              onSubmit={send}
-              placeholder="ถามอะไรก็ได้… ระบบจะเรียกพนักงานที่ตรงเรื่องมาตอบ (พิมพ์ @ เพื่อเลือกคน)"
+              onSubmit={dispatch}
+              placeholder="สั่งงาน… พิมพ์ @ เพื่อเลือกคน  ·  ส่งงานต่อได้ทันที ไม่ต้องรอคนก่อนหน้าจบ"
               rows={2}
               className="input min-h-[52px] flex-1 w-full"
-              disabled={streaming}
+              disabled={false}
             />
-            {streaming ? (
-              <button onClick={stop} className="btn-primary !bg-danger hover:!bg-danger/80">
-                หยุด
-              </button>
-            ) : (
-              <button
-                onClick={send}
-                className="btn-primary"
-                disabled={!input.trim() && pendingFiles.length === 0}
-              >
-                ส่ง
-              </button>
-            )}
+            <button
+              onClick={() => dispatch()}
+              className="btn-primary"
+              disabled={dispatching || (!input.trim() && pendingFiles.length === 0)}
+              title="ส่งงาน — จะเปิด session ใหม่ คุณสั่งคนอื่นต่อได้เลย"
+            >
+              {dispatching ? "ส่ง…" : "ส่งงาน"}
+            </button>
           </div>
+          <p className="mt-1.5 text-center text-[10px] text-ink-dim/60">
+            งานทำในห้องย่อยของแต่ละคน · บอร์ดนี้แสดงแค่สถานะ · กด &ldquo;เปิดห้อง&rdquo; เพื่อดูรายละเอียดเต็ม
+          </p>
         </div>
       </div>
     </section>
   );
 }
 
-/* ---------- Bubbles ---------- */
+/* ---------- Task card ---------- */
 
-function UserBubble({ message }: { message: Extract<Msg, { role: "user" }> }) {
-  return (
-    <div className="flex justify-end gap-3">
-      <div className="max-w-[85%] rounded-2xl bg-accent-soft px-4 py-2.5 text-sm leading-relaxed text-white">
-        {message.attachments && message.attachments.length > 0 && (
-          <div className="mb-2 flex flex-wrap gap-1.5">
-            {message.attachments.map((a) => (
-              <AttachPreview key={a.path} a={a} dark />
-            ))}
-          </div>
-        )}
-        <p className="whitespace-pre-wrap">{message.content}</p>
-      </div>
-    </div>
-  );
-}
-
-function AssistantBubble({
-  message,
-  streaming,
+function TaskCard({
+  task,
+  job,
+  onOpenDirect,
 }: {
-  message: Extract<Msg, { role: "assistant" }>;
-  streaming: boolean;
+  task: Task;
+  job: ClientJob | undefined;
+  onOpenDirect: (slug: EmployeeSlug) => void;
 }) {
-  const r = message.respondent;
-  const accent = r?.accent ?? "indigo";
+  const status = job?.status ?? task.initialStatus;
+  const accent = task.respondent.accent ?? "indigo";
   const borderClass = ACCENT_BORDER[accent];
-  const chipClass = ACCENT_BG_SOFT[accent];
+  const chipBg = ACCENT_BG_SOFT[accent];
+
+  const [elapsed, setElapsed] = useState(() =>
+    job?.startedAt ? Date.now() - job.startedAt : 0,
+  );
+  useEffect(() => {
+    if (status !== "running" && status !== "queued") return;
+    const startedAt = job?.startedAt ?? task.dispatchedAt;
+    const id = setInterval(() => setElapsed(Date.now() - startedAt), 1000);
+    return () => clearInterval(id);
+  }, [status, job?.startedAt, task.dispatchedAt]);
+
+  // Prefer the real EmployeeMeta from the registry so the avatar uses the
+  // same seed as everywhere else; fall back to a synthetic stub for
+  // placeholder/unknown respondents.
+  const employee: EmployeeMeta = useMemo(() => {
+    const real = EMPLOYEES.find((e) => e.slug === task.respondent.slug);
+    if (real) return real;
+    return {
+      slug: task.respondent.slug,
+      name: task.respondent.name,
+      firstName: task.respondent.name.split(" ")[0],
+      title: task.respondent.title || "",
+      department: task.respondent.department || "",
+      accent,
+      blurb: "",
+      avatarSeed: task.respondent.name,
+      kpiIds: [],
+      dataFiles: [],
+    };
+  }, [task.respondent, accent]);
 
   return (
-    <div className="flex justify-start gap-3">
-      <div className="shrink-0 pt-2">
-        {r ? (
-          <Avatar employee={{ name: r.name, avatarSeed: r.name, accent }} size={36} ring />
-        ) : (
-          <div className="flex h-9 w-9 items-center justify-center rounded-full bg-surface-2 text-xs text-ink-dim">…</div>
-        )}
-      </div>
-      <div className={`max-w-[85%] min-w-[220px] rounded-2xl border ${borderClass} bg-surface px-4 py-2.5 text-sm leading-relaxed text-ink`}>
-        {r && (
-          <div className="mb-1.5 flex flex-wrap items-center gap-1.5 border-b border-border/60 pb-1.5 text-[11px]">
-            <span className="font-semibold text-ink">{r.name}</span>
-            <span className="text-ink-dim">·</span>
-            <span className="text-ink-dim">{r.title}</span>
-            <span className={`pill ml-auto ${chipClass.replace("bg-", "bg-")}`}>
-              ↳ {r.reason}
-            </span>
+    <div className={`rounded-2xl border ${borderClass} bg-surface px-4 py-3 text-sm shadow-sm`}>
+      <div className="flex items-start gap-3">
+        <Avatar employee={employee} size={36} ring />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-ink">{task.respondent.name}</span>
+            {task.respondent.title && (
+              <>
+                <span className="text-ink-dim">·</span>
+                <span className="text-[11px] text-ink-dim">{task.respondent.title}</span>
+              </>
+            )}
+            {task.respondent.reason && (
+              <span className={`pill ${chipBg}`}>↳ {task.respondent.reason}</span>
+            )}
+            <StatusPill status={status} elapsed={elapsed} job={job} className="ml-auto" />
           </div>
-        )}
-        {!r && streaming && (
-          <p className="flex items-center gap-2 text-xs text-ink-dim italic">
-            <Spinner /> กำลังหาคนที่ตรงเรื่องที่สุด…
+
+          <p className="mt-2 line-clamp-2 whitespace-pre-wrap text-[13px] text-ink-dim">
+            <span className="text-ink-dim/60">› </span>
+            {task.prompt}
           </p>
-        )}
 
-        {message.blocks.length === 0 && r && !streaming && (
-          <p className="text-ink-dim italic">(ไม่มีคำตอบ)</p>
-        )}
-
-        <div className="space-y-2">
-          {message.blocks.map((b, i) => (
-            <BlockView key={i} block={b} />
-          ))}
-        </div>
-
-        {streaming &&
-          r &&
-          (message.blocks.length === 0 ||
-            message.blocks[message.blocks.length - 1].kind !== "text") && (
-            <div className="mt-2 inline-flex items-center gap-2 rounded-md bg-surface-2/60 px-2 py-1 text-[11px] text-ink-dim">
-              <Spinner />
-              <span>กำลังคิด…</span>
+          {task.attachments && task.attachments.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              {task.attachments.map((a) => (
+                <span
+                  key={a.path}
+                  className="inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-1.5 py-0.5 text-[10px] text-ink-dim"
+                  title={a.name}
+                >
+                  📎 <span className="max-w-[140px] truncate">{a.name}</span>
+                </span>
+              ))}
             </div>
           )}
 
-        {message.generatedFiles && message.generatedFiles.length > 0 && (
-          <GeneratedFilesPreview files={message.generatedFiles} />
-        )}
-
-        {message.status === "done" && message.durationMs != null && (
-          <div className="mt-2 border-t border-border/60 pt-1.5 text-[10px] text-ink-dim/60">
-            ✓ เสร็จใน {(message.durationMs / 1000).toFixed(1)}s
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function GeneratedFilesPreview({ files }: { files: GeneratedFile[] }) {
-  const fileUrl = (p: string) =>
-    `/api/outputs/file/${p
-      .split("/")
-      .map(encodeURIComponent)
-      .join("/")}`;
-  return (
-    <div className="mt-3 space-y-1.5 border-t border-border/60 pt-2">
-      <p className="text-[10px] font-medium uppercase tracking-wider text-ink-dim/70">
-        📁 สร้างไฟล์ {files.length} ตัว
-      </p>
-      <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
-        {files.map((f) => (
-          <a
-            key={f.path}
-            href={fileUrl(f.path)}
-            target="_blank"
-            rel="noreferrer"
-            className="group flex flex-col overflow-hidden rounded-lg border border-border/60 bg-surface-2/40 hover:border-accent"
-            title={`${f.name} · ${Math.round(f.size / 1024)} KB`}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={fileUrl(f.path)}
-              alt={f.name}
-              className="aspect-square w-full object-cover transition-opacity group-hover:opacity-80"
-              loading="lazy"
-            />
-            <p className="truncate px-1.5 py-1 text-[10px] text-ink-dim group-hover:text-ink">
-              {f.name}
+          {/* Result preview when done */}
+          {status === "done" && job?.resultPreview && (
+            <p className="mt-2 line-clamp-3 rounded-md bg-surface-2/40 px-2.5 py-1.5 text-[12px] text-ink">
+              {job.resultPreview}
             </p>
-          </a>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function BlockView({ block }: { block: Block }) {
-  if (block.kind === "text") {
-    return (
-      <div className="markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{block.text}</ReactMarkdown>
-      </div>
-    );
-  }
-  if (block.kind === "thinking") {
-    return (
-      <details className="rounded-lg border border-accent/20 bg-accent-soft/5 px-2.5 py-1.5 text-xs text-ink-dim">
-        <summary className="cursor-pointer">
-          <span className="font-medium text-accent">🧠 ความคิดภายใน</span>
-        </summary>
-        <p className="mt-1.5 whitespace-pre-wrap text-[11px] italic">{block.text}</p>
-      </details>
-    );
-  }
-  return <ToolBlock block={block} />;
-}
-
-function ToolBlock({ block }: { block: Extract<Block, { kind: "tool" }> }) {
-  const tone =
-    block.status === "running"
-      ? "border-accent/40 bg-accent-soft/10 text-accent"
-      : block.status === "error"
-        ? "border-danger/40 bg-danger/10 text-danger"
-        : "border-ok/30 bg-ok/5 text-ok";
-  const icon = TOOL_ICONS[block.name] || "🔧";
-  const label = TOOL_LABELS[block.name] || block.name;
-  return (
-    <div className={`rounded-lg border ${tone} px-2.5 py-1.5 text-xs`}>
-      <div className="flex items-center gap-2">
-        <span>{icon}</span>
-        <span className="font-semibold">{label}</span>
-        {block.summary && (
-          <code className="truncate font-mono text-[11px] opacity-80">
-            {block.summary}
-          </code>
-        )}
-        <span className="ml-auto flex items-center gap-1 text-[10px] opacity-80">
-          {block.status === "running" && (
-            <>
-              <Spinner /> <span>กำลังทำงาน…</span>
-            </>
           )}
-          {block.status === "ok" && <span>เสร็จ ✓</span>}
-          {block.status === "error" && <span>ผิดพลาด ✗</span>}
-        </span>
+          {status === "error" && job?.errorMessage && (
+            <p className="mt-2 rounded-md border border-danger/30 bg-danger/5 px-2.5 py-1.5 text-[11.5px] text-danger">
+              ✗ {job.errorMessage}
+            </p>
+          )}
+
+          <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/60 pt-1.5">
+            <span className="text-[10px] text-ink-dim/60">
+              {status === "done" && job?.durationMs != null && (
+                <>✓ เสร็จใน {(job.durationMs / 1000).toFixed(1)}s</>
+              )}
+              {status === "aborted" && <span className="text-ink-dim">⊘ ยกเลิกแล้ว</span>}
+            </span>
+            <div className="flex items-center gap-1.5">
+              {(status === "running" || status === "queued") && job && (
+                <button
+                  onClick={() => abortJob(job.id)}
+                  className="rounded-md border border-border bg-surface px-2 py-0.5 text-[10.5px] text-ink-dim hover:border-danger hover:text-danger"
+                  title="ยกเลิกงานนี้"
+                >
+                  × ยกเลิก
+                </button>
+              )}
+              <button
+                onClick={() => onOpenDirect(task.respondent.slug)}
+                className="rounded-md border border-accent/30 bg-accent-soft/10 px-2 py-0.5 text-[10.5px] text-accent hover:bg-accent-soft/20"
+                title={`เปิดห้องของ ${task.respondent.name.split(" ")[0]} เพื่อดูรายละเอียดเต็ม`}
+              >
+                เปิดห้อง →
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
-      {block.preview && (
-        <details className="mt-1.5">
-          <summary className="cursor-pointer text-[10px] opacity-70 hover:opacity-100">
-            ดูผลที่ได้
-          </summary>
-          <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-bg/40 p-2 font-mono text-[10px] text-ink-dim">
-            {block.preview}
-          </pre>
-        </details>
-      )}
     </div>
   );
 }
 
-/* ---------- Empty + helpers ---------- */
+function StatusPill({
+  status,
+  elapsed,
+  job,
+  className = "",
+}: {
+  status: ClientJob["status"];
+  elapsed: number;
+  job: ClientJob | undefined;
+  className?: string;
+}) {
+  if (status === "running" || status === "queued") {
+    return (
+      <span
+        className={`inline-flex items-center gap-1.5 rounded-full bg-accent-soft/15 px-2 py-0.5 text-[11px] text-accent ${className}`}
+      >
+        <Spinner />
+        <span>{status === "queued" ? "เข้าคิว…" : "กำลังคิด"}</span>
+        <span className="opacity-70">{fmtElapsed(elapsed)}</span>
+      </span>
+    );
+  }
+  if (status === "done") {
+    return (
+      <span
+        className={`inline-flex items-center gap-1 rounded-full bg-ok/10 px-2 py-0.5 text-[11px] text-ok ${className}`}
+      >
+        ✓ เสร็จแล้ว
+        {job?.durationMs != null && (
+          <span className="opacity-70">{(job.durationMs / 1000).toFixed(1)}s</span>
+        )}
+      </span>
+    );
+  }
+  if (status === "error") {
+    return (
+      <span
+        className={`inline-flex items-center gap-1 rounded-full bg-danger/10 px-2 py-0.5 text-[11px] text-danger ${className}`}
+      >
+        ✗ ผิดพลาด
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full bg-surface-2 px-2 py-0.5 text-[11px] text-ink-dim ${className}`}
+    >
+      ⊘ ยกเลิก
+    </span>
+  );
+}
 
-function EmptyMeetingRoom({ onPick }: { onPick: (q: string) => void }) {
+function ActiveCounter({
+  tasks,
+  jobsById,
+}: {
+  tasks: Task[];
+  jobsById: Map<string, ClientJob>;
+}) {
+  const counts = useMemo(() => {
+    let active = 0;
+    let done = 0;
+    for (const t of tasks) {
+      const j = jobsById.get(t.jobId);
+      const s = j?.status ?? "queued";
+      if (s === "running" || s === "queued") active++;
+      else if (s === "done") done++;
+    }
+    return { active, done };
+  }, [tasks, jobsById]);
+  if (counts.active === 0 && counts.done === 0) return null;
+  return (
+    <>
+      {counts.active > 0 && (
+        <span className="text-accent">{counts.active} กำลังทำ</span>
+      )}
+      {counts.active > 0 && counts.done > 0 && <span className="text-ink-dim"> · </span>}
+      {counts.done > 0 && <span className="text-ok">{counts.done} เสร็จ</span>}
+    </>
+  );
+}
+
+/* ---------- Picker / empty / helpers ---------- */
+
+function AgentPickerBar({
+  input,
+  onPing,
+  disabled,
+}: {
+  input: string;
+  onPing: (firstName: string) => void;
+  disabled?: boolean;
+}) {
+  const hasText = input.trim().length > 0;
+  return (
+    <div className="mb-2 flex items-center gap-1.5 overflow-x-auto pb-1">
+      <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wider text-ink-dim/70">
+        {hasText ? "สั่ง →" : "เรียกใคร →"}
+      </span>
+      {EMPLOYEES.map((e) => (
+        <button
+          key={e.slug}
+          type="button"
+          onClick={() => onPing(e.firstName)}
+          disabled={disabled}
+          title={
+            hasText
+              ? `สั่งงานนี้ให้ ${e.firstName} (${e.title})`
+              : `เรียก ${e.firstName} (${e.title})`
+          }
+          className="flex shrink-0 items-center gap-1.5 rounded-full border border-border bg-surface px-2 py-0.5 text-[11px] text-ink-dim transition hover:border-accent hover:bg-accent-soft/15 hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <Avatar employee={e} size={18} />
+          <span className="font-medium">@{e.firstName}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function EmptyBoard({ onPick }: { onPick: (q: string) => void }) {
   const samples = [
     "สรุปสุขภาพบริษัทตอนนี้",
     "เพิ่ม task ส่ง proposal โรงเรียนสาธิตให้ Jordan due 2026-05-25",
@@ -729,13 +711,15 @@ function EmptyMeetingRoom({ onPick }: { onPick: (q: string) => void }) {
         ))}
       </div>
       <div>
-        <h2 className="text-lg font-semibold text-ink">ห้องประชุมกลาง</h2>
-        <p className="mt-1 max-w-sm text-sm text-ink-dim">
-          ถามอะไรก็ได้ — ระบบจะเลือกพนักงานที่ตรงเรื่องที่สุดให้กระโดดเข้ามาตอบ
+        <h2 className="text-lg font-semibold text-ink">บอร์ดสั่งงาน</h2>
+        <p className="mt-1 max-w-md text-sm text-ink-dim">
+          พิมพ์งาน — ระบบจะส่งให้พนักงานที่เกี่ยวข้องทำในห้องของเขาเอง
+          บอร์ดนี้แสดงแค่สถานะ “กำลังคิด / เสร็จแล้ว”
+          คุณสั่งคนถัดไปได้ทันทีโดยไม่ต้องรอ
         </p>
         <p className="mt-2 text-xs text-ink-dim/70">
-          💡 ใช้ <code className="text-accent">@Jordan</code> /{" "}
-          <code className="text-accent">@Daniel</code> เพื่อระบุคน
+          💡 <code className="text-accent">@Jordan</code> /{" "}
+          <code className="text-accent">@Daniel</code> เพื่อระบุคน · กด &ldquo;เปิดห้อง&rdquo; ที่การ์ดเพื่อดูรายละเอียดเต็ม
         </p>
       </div>
       <div className="flex flex-wrap justify-center gap-2">
@@ -750,34 +734,6 @@ function EmptyMeetingRoom({ onPick }: { onPick: (q: string) => void }) {
         ))}
       </div>
     </div>
-  );
-}
-
-function AttachPreview({ a, dark }: { a: Attachment; dark: boolean }) {
-  const isImage = a.mimeType.startsWith("image/");
-  if (isImage) {
-    return (
-      <a href={a.url} target="_blank" rel="noreferrer" className="block overflow-hidden rounded-lg border border-white/20">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={a.url} alt={a.name} className="h-24 w-24 object-cover" />
-      </a>
-    );
-  }
-  return (
-    <a
-      href={a.url}
-      target="_blank"
-      rel="noreferrer"
-      className={[
-        "inline-flex items-center gap-2 rounded-lg border px-2 py-1 text-xs",
-        dark
-          ? "border-white/20 bg-white/10 text-white hover:bg-white/20"
-          : "border-border bg-surface-2 text-ink-dim hover:text-ink",
-      ].join(" ")}
-    >
-      <FileIcon />
-      <span className="max-w-[160px] truncate">{a.name}</span>
-    </a>
   );
 }
 
@@ -823,56 +779,10 @@ function FileIcon() {
   );
 }
 
-function appendText(blocks: Block[], text: string): Block[] {
-  const last = blocks[blocks.length - 1];
-  if (last && last.kind === "text") {
-    return [...blocks.slice(0, -1), { kind: "text", text: last.text + text }];
-  }
-  return [...blocks, { kind: "text", text }];
-}
-
-function appendThinking(blocks: Block[], text: string): Block[] {
-  const last = blocks[blocks.length - 1];
-  if (last && last.kind === "thinking") {
-    return [...blocks.slice(0, -1), { kind: "thinking", text: last.text + text }];
-  }
-  return [...blocks, { kind: "thinking", text }];
-}
-
-function blocksToText(blocks: Block[]): string {
-  return blocks
-    .filter((b): b is Extract<Block, { kind: "text" }> => b.kind === "text")
-    .map((b) => b.text)
-    .join("\n");
-}
-
-/** Shape used by /api/chats/<id> response */
-interface PersistedMsg {
-  role: "user" | "assistant";
-  content?: string;
-  attachments?: Attachment[];
-  respondent?: Respondent | null;
-  blocks?: Block[];
-  status?: "done" | "error";
-  durationMs?: number;
-  timestamp?: string;
-}
-
-function hydrateMsg(m: PersistedMsg): Msg {
-  if (m.role === "user") {
-    return {
-      role: "user",
-      content: m.content || "",
-      attachments: m.attachments,
-    };
-  }
-  return {
-    role: "assistant",
-    respondent: m.respondent ?? null,
-    blocks: m.blocks ?? [],
-    status: m.status === "error" ? "error" : "done",
-    durationMs: m.durationMs,
-  };
+function fmtElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
 function prettyBytes(n: number): string {
@@ -881,22 +791,13 @@ function prettyBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-const TOOL_LABELS: Record<string, string> = {
-  Read: "อ่านไฟล์",
-  Write: "เขียนไฟล์",
-  Edit: "แก้ไขไฟล์",
-  Grep: "ค้นหาในไฟล์",
-  Glob: "ค้นชื่อไฟล์",
-  Bash: "รันคำสั่ง",
-  WebSearch: "ค้นเว็บ",
-};
-
-const TOOL_ICONS: Record<string, string> = {
-  Read: "📖",
-  Write: "✍️",
-  Edit: "📝",
-  Grep: "🔍",
-  Glob: "🗂️",
-  Bash: "⚙️",
-  WebSearch: "🌐",
+/** Placeholder used while waiting for the first job-stream snapshot to fill in
+ *  details about a task we loaded from localStorage. */
+const PLACEHOLDER_RESPONDENT: Respondent = {
+  slug: "ceo",
+  name: "…",
+  title: "",
+  department: "",
+  accent: "indigo",
+  reason: "",
 };

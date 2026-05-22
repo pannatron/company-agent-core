@@ -10,9 +10,11 @@ import TaskBoardView from "@/components/TaskBoard";
 import SocialView from "@/components/SocialView";
 import KpiPanel from "@/components/KpiPanel";
 import FilesView from "@/components/FilesView";
+import JobTicker from "@/components/JobTicker";
 import { EmployeeMeta, EMPLOYEES, EmployeeSlug } from "@/lib/employees";
 import { KpiFile, KpiItem } from "@/components/kpi-utils";
 import { CompanyProfile } from "@/lib/companyProfile";
+import { useJobStream } from "@/lib/useJobStream";
 
 export default function HomePage() {
   const router = useRouter();
@@ -27,6 +29,40 @@ export default function HomePage() {
   const [spotlight, setSpotlight] = useState<EmployeeSlug | null>(null);
   const [seedPrompt, setSeedPrompt] = useState<string | null>(null);
   const [tasksRefresh, setTasksRefresh] = useState(0);
+
+  // Collapsible side panels — persisted to localStorage so layout sticks.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  useEffect(() => {
+    try {
+      setSidebarCollapsed(localStorage.getItem("ui.sidebarCollapsed") === "1");
+      setRailCollapsed(localStorage.getItem("ui.railCollapsed") === "1");
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem("ui.sidebarCollapsed", next ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
+  const toggleRail = useCallback(() => {
+    setRailCollapsed((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem("ui.railCollapsed", next ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -71,6 +107,14 @@ export default function HomePage() {
     refreshKpi();
   }, [refreshKpi]);
 
+  // Subscribe to job stream at the page level so the sidebar can highlight
+  // and reorder employees that are currently running a turn.
+  const { active: activeJobs } = useJobStream();
+  const activeBySlug = new Map<string, "running" | "queued">();
+  for (const j of activeJobs) {
+    activeBySlug.set(j.employeeSlug, j.status === "queued" ? "queued" : "running");
+  }
+
   if (loading || !company) {
     return (
       <main className="flex h-screen items-center justify-center text-ink-dim">
@@ -83,6 +127,17 @@ export default function HomePage() {
     ? EMPLOYEES.find((e) => e.slug === direct)
     : undefined;
 
+  // chatId of the currently visible room — used by JobTicker to know which
+  // jobs to hide (the room itself already shows its own streaming UI).
+  const currentChatId =
+    view === "meeting" ? (direct ? `direct-${direct}` : "meeting-room") : undefined;
+
+  const jumpToRoom = (chatId: string) => {
+    if (chatId === "meeting-room") setDirect(null);
+    else if (chatId.startsWith("direct-")) setDirect(chatId.slice("direct-".length));
+    setView("meeting");
+  };
+
   return (
     <main className="grid h-screen grid-rows-[auto_1fr] bg-bg">
       <TopBar
@@ -93,7 +148,12 @@ export default function HomePage() {
         onReconfigure={() => router.push("/setup")}
       />
 
-      <div className="grid min-h-0 grid-cols-[260px_1fr_320px]">
+      <div
+        className="grid min-h-0"
+        style={{
+          gridTemplateColumns: `${sidebarCollapsed ? 56 : 260}px 1fr ${railCollapsed ? 48 : 320}px`,
+        }}
+      >
         <TeamSidebar
           employees={EMPLOYEES}
           kpis={kpis}
@@ -107,9 +167,14 @@ export default function HomePage() {
             setDirect(slug);
             setView("meeting"); // direct chat lives inside the "meeting" slot
           }}
+          collapsed={sidebarCollapsed}
+          onToggleCollapse={toggleSidebar}
+          activeBySlug={activeBySlug}
         />
 
         <div className="flex min-h-0 flex-col">
+          <JobTicker currentChatId={currentChatId} onJumpToRoom={jumpToRoom} />
+
           {view === "meeting" &&
             (direct && directEmployee ? (
               <DirectChatHeader
@@ -128,6 +193,10 @@ export default function HomePage() {
                 seed={seedPrompt}
                 onRespondent={setSpotlight}
                 onAgentTurn={onAgentTurn}
+                onOpenDirect={(slug) => {
+                  setDirect(slug);
+                  setView("meeting");
+                }}
               />
             )
           ) : null}
@@ -165,7 +234,12 @@ export default function HomePage() {
           {view === "files" && <FilesView />}
         </div>
 
-        <RightRail kpis={kpis} updatedAt={kpiUpdated} />
+        <RightRail
+          kpis={kpis}
+          updatedAt={kpiUpdated}
+          collapsed={railCollapsed}
+          onToggleCollapse={toggleRail}
+        />
       </div>
     </main>
   );
@@ -196,13 +270,22 @@ function DirectChatHeader({
 function RightRail({
   kpis,
   updatedAt,
+  collapsed,
+  onToggleCollapse,
 }: {
   kpis: KpiItem[];
   updatedAt: string | null;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
 }) {
   return (
     <div className="min-h-0">
-      <KpiPanel kpis={kpis} updatedAt={updatedAt} />
+      <KpiPanel
+        kpis={kpis}
+        updatedAt={updatedAt}
+        collapsed={collapsed}
+        onToggleCollapse={onToggleCollapse}
+      />
     </div>
   );
 }

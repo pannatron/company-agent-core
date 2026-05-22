@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { CompanyProfile } from "@/lib/companyProfile";
 import { formatNumber, KpiItem, kpiStatusColor, pctOfTarget } from "./kpi-utils";
 
@@ -14,10 +15,10 @@ interface Props {
 }
 
 const TABS: { key: ViewKey; label: string; icon: string }[] = [
-  { key: "meeting", label: "Meeting Room", icon: "🏛" },
-  { key: "tasks", label: "Task Board", icon: "📋" },
+  { key: "meeting", label: "Meeting", icon: "🏛" },
+  { key: "tasks", label: "Tasks", icon: "📋" },
   { key: "social", label: "Social", icon: "📱" },
-  { key: "kpi", label: "KPI Detail", icon: "📊" },
+  { key: "kpi", label: "KPI", icon: "📊" },
   { key: "files", label: "Files", icon: "📁" },
 ];
 
@@ -28,48 +29,50 @@ export default function TopBar({
   onView,
   onReconfigure,
 }: Props) {
-  // pick 3 KPIs to surface — prefer KPIs that are worst first
-  const sorted = [...kpis].sort((a, b) => statusRank(a.status) - statusRank(b.status));
-  const featured = sorted.slice(0, 3);
+  // Surface only KPIs that need attention (worst first, max 2)
+  const alerts = kpis
+    .filter((k) => k.status === "off_track" || k.status === "at_risk")
+    .sort((a, b) => statusRank(a.status) - statusRank(b.status))
+    .slice(0, 2);
+
+  // Probe whether a real logo exists. Falls back to gradient mark if not.
+  const [hasLogo, setHasLogo] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/brand/logo?info=1")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((info: { exists?: boolean } | null) => {
+        if (alive && info?.exists) setHasLogo(true);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   return (
-    <header className="border-b border-border bg-surface/40 backdrop-blur-sm">
-      <div className="flex items-stretch">
-        {/* Company brand */}
-        <div className="flex items-center gap-3 border-r border-border px-5 py-3">
-          <div className="h-9 w-9 shrink-0 rounded-xl bg-gradient-to-br from-indigo-500 to-fuchsia-500" />
-          <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-ink">
-              {company.name || "Virtual AI Company"}
-            </p>
-            <p className="truncate text-[11px] text-ink-dim">
-              {company.industry} · ทีม {company.team_size} คน · {company.currency}
-            </p>
-          </div>
-        </div>
-
-        {/* KPI strip */}
-        <div className="flex flex-1 items-center gap-2 overflow-x-auto px-4 py-2">
-          {featured.length === 0 ? (
-            <p className="text-xs text-ink-dim">ยังไม่มี KPI</p>
-          ) : (
-            featured.map((k) => <KpiMini key={k.id} k={k} />)
-          )}
-        </div>
-
-        {/* Settings */}
-        <div className="flex items-center border-l border-border px-3">
-          <button
-            onClick={onReconfigure}
-            className="rounded-lg border border-border bg-surface-2 px-3 py-1.5 text-xs text-ink-dim hover:border-accent hover:text-ink"
-          >
-            ⚙ ตั้งค่าบริษัท
-          </button>
-        </div>
+    <header className="flex items-center gap-3 border-b border-border bg-surface/40 px-4 py-2 backdrop-blur-sm">
+      {/* Company brand (compact) */}
+      <div className="flex min-w-0 items-center gap-2.5">
+        {hasLogo ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src="/api/brand/logo"
+            alt={company.name || "Logo"}
+            className="h-8 w-8 shrink-0 rounded-lg object-cover ring-1 ring-border bg-surface-2"
+          />
+        ) : (
+          <div className="h-8 w-8 shrink-0 rounded-lg bg-gradient-to-br from-indigo-500 to-fuchsia-500" />
+        )}
+        <p className="hidden truncate text-sm font-semibold text-ink md:block">
+          {company.name || "Virtual AI Company"}
+        </p>
       </div>
 
-      {/* Tabs */}
-      <nav className="flex items-center gap-1 border-t border-border/50 px-4">
+      <span className="hidden h-6 w-px shrink-0 bg-border md:block" />
+
+      {/* Tabs (primary nav) */}
+      <nav className="flex shrink-0 items-center gap-0.5">
         {TABS.map((t) => {
           const active = t.key === view;
           return (
@@ -77,42 +80,56 @@ export default function TopBar({
               key={t.key}
               onClick={() => onView(t.key)}
               className={[
-                "relative px-3 py-2.5 text-xs font-medium transition",
-                active ? "text-ink" : "text-ink-dim hover:text-ink",
+                "flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition",
+                active
+                  ? "bg-surface-2 text-ink shadow-sm ring-1 ring-border"
+                  : "text-ink-dim hover:bg-surface-2/60 hover:text-ink",
               ].join(" ")}
             >
-              <span className="mr-1.5">{t.icon}</span>
-              {t.label}
-              {active && (
-                <span className="absolute inset-x-3 -bottom-px h-0.5 rounded-full bg-accent" />
-              )}
+              <span>{t.icon}</span>
+              <span className="hidden sm:inline">{t.label}</span>
             </button>
           );
         })}
       </nav>
+
+      {/* Spacer */}
+      <div className="flex-1" />
+
+      {/* KPI alerts (only off-track / at-risk) */}
+      <div className="hidden items-center gap-1.5 lg:flex">
+        {alerts.length === 0 ? (
+          <span className="rounded-md bg-surface-2/60 px-2 py-1 text-[10px] text-ink-dim">
+            ✓ KPI ปกติ
+          </span>
+        ) : (
+          alerts.map((k) => <KpiAlert key={k.id} k={k} />)
+        )}
+      </div>
+
+      {/* Settings */}
+      <button
+        onClick={onReconfigure}
+        title="ตั้งค่าบริษัท"
+        className="rounded-md border border-border bg-surface-2 px-2 py-1.5 text-xs text-ink-dim hover:border-accent hover:text-ink"
+      >
+        ⚙
+      </button>
     </header>
   );
 }
 
-function KpiMini({ k }: { k: KpiItem }) {
+function KpiAlert({ k }: { k: KpiItem }) {
   const dot = kpiStatusColor(k.status);
   const pct = pctOfTarget(k);
   return (
-    <div className="flex shrink-0 items-center gap-2 rounded-lg border border-border bg-surface px-3 py-1.5 text-xs">
+    <div
+      className="flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-[11px]"
+      title={`${k.name}: ${formatNumber(k.current, k.unit)} / ${formatNumber(k.target, k.unit)} ${k.unit}`}
+    >
       <span className={`status-dot ${dot}`} />
-      <div className="leading-tight">
-        <p className="text-[10px] uppercase tracking-wide text-ink-dim/80">
-          {k.name}
-        </p>
-        <p className="font-mono text-ink">
-          {formatNumber(k.current, k.unit)}
-          <span className="text-ink-dim">
-            {" / "}
-            {formatNumber(k.target, k.unit)} {k.unit}
-          </span>
-          <span className="ml-1.5 text-[10px] text-ink-dim/70">({pct}%)</span>
-        </p>
-      </div>
+      <span className="max-w-[140px] truncate text-ink">{k.name}</span>
+      <span className="font-mono text-ink-dim">{pct}%</span>
     </div>
   );
 }

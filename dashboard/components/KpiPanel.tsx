@@ -8,14 +8,62 @@ interface Props {
   kpis: KpiItem[];
   updatedAt: string | null;
   fullScreen?: boolean;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }
 
-export default function KpiPanel({ kpis, updatedAt, fullScreen = false }: Props) {
+export default function KpiPanel({
+  kpis,
+  updatedAt,
+  fullScreen = false,
+  collapsed = false,
+  onToggleCollapse,
+}: Props) {
   const counts = {
     on_track: kpis.filter((k) => k.status === "on_track").length,
     at_risk: kpis.filter((k) => k.status === "at_risk").length,
     off_track: kpis.filter((k) => k.status === "off_track").length,
   };
+
+  if (!fullScreen && collapsed) {
+    return (
+      <aside className="flex h-full flex-col items-center gap-2 border-l border-border bg-surface/40 py-3 backdrop-blur-sm">
+        <button
+          onClick={onToggleCollapse}
+          title="ขยาย KPI panel"
+          className="rounded-md border border-border bg-surface px-1.5 py-1.5 text-xs text-ink-dim hover:border-accent hover:text-ink"
+        >
+          ‹
+        </button>
+        <p className="rotate-180 text-[10px] font-semibold uppercase tracking-wider text-ink-dim [writing-mode:vertical-rl]">
+          KPI
+        </p>
+        <div className="mt-1 flex flex-col items-center gap-2">
+          <div
+            className="flex flex-col items-center gap-0.5"
+            title={`on-track ${counts.on_track}`}
+          >
+            <span className="status-dot ok" />
+            <span className="font-mono text-[10px] text-ink-dim">{counts.on_track}</span>
+          </div>
+          <div
+            className="flex flex-col items-center gap-0.5"
+            title={`at-risk ${counts.at_risk}`}
+          >
+            <span className="status-dot warn" />
+            <span className="font-mono text-[10px] text-ink-dim">{counts.at_risk}</span>
+          </div>
+          <div
+            className="flex flex-col items-center gap-0.5"
+            title={`off-track ${counts.off_track}`}
+          >
+            <span className="status-dot danger" />
+            <span className="font-mono text-[10px] text-ink-dim">{counts.off_track}</span>
+          </div>
+        </div>
+      </aside>
+    );
+  }
 
   return (
     <aside
@@ -25,16 +73,27 @@ export default function KpiPanel({ kpis, updatedAt, fullScreen = false }: Props)
       ].join(" ")}
     >
       <header className="border-b border-border px-4 py-3">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <h2 className={[
             "font-semibold uppercase tracking-wide text-ink-dim",
             fullScreen ? "text-sm text-ink" : "text-sm",
           ].join(" ")}>
             {fullScreen ? "KPI / OKR ของบริษัท" : "KPI Snapshot"}
           </h2>
-          {updatedAt && (
-            <span className="text-[10px] text-ink-dim/60">อัปเดต {updatedAt}</span>
-          )}
+          <div className="flex items-center gap-2">
+            {updatedAt && (
+              <span className="text-[10px] text-ink-dim/60">อัปเดต {updatedAt}</span>
+            )}
+            {!fullScreen && onToggleCollapse && (
+              <button
+                onClick={onToggleCollapse}
+                title="ย่อ KPI panel"
+                className="rounded-md border border-border bg-surface px-1.5 py-0.5 text-xs text-ink-dim hover:border-accent hover:text-ink"
+              >
+                ›
+              </button>
+            )}
+          </div>
         </div>
         <div className="mt-2 flex flex-wrap gap-2">
           <span className="pill pill-ok">
