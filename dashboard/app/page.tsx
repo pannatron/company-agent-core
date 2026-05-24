@@ -170,6 +170,7 @@ export default function HomePage() {
           collapsed={sidebarCollapsed}
           onToggleCollapse={toggleSidebar}
           activeBySlug={activeBySlug}
+          refreshSignal={tasksRefresh}
         />
 
         <div className="flex min-h-0 flex-col">
