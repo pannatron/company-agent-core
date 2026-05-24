@@ -1,7 +1,13 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { EMPLOYEES, EmployeeMeta } from "./employees";
-import { readAgentFile, readClaudeMd, readDataFile, DATA_DIR } from "./repo";
+import {
+  readAgentFile,
+  readClaudeMd,
+  readDataFile,
+  DATA_DIR,
+  REPO_ROOT,
+} from "./repo";
 import { CompanyProfile } from "./companyProfile";
 
 async function readCompanyProfile(): Promise<CompanyProfile | null> {
@@ -119,10 +125,28 @@ export async function buildSystemPrompt(employee: EmployeeMeta): Promise<string>
     "=========================================",
     dataSections.join(""),
     "",
+    "=========================================",
+    "Path บนเครื่องนี้ (สำคัญมาก — ใช้ตามนี้เด็ดขาด):",
+    "=========================================",
+    `REPO_ROOT = ${REPO_ROOT}`,
+    `OUTPUTS_DIR = ${path.join(REPO_ROOT, "outputs")}`,
+    `DATA_DIR = ${DATA_DIR}`,
+    "",
+    "กฎเรื่อง path (ป้องกัน trial-and-error):",
+    "- Write/Edit/Read tool บังคับ absolute path เสมอ — ห้ามใช้ relative",
+    "- ห้ามเดา username/ชื่อโปรเจกต์เอง ใช้ค่าจาก REPO_ROOT ข้างบนเท่านั้น",
+    "- เซฟเอกสารเสมอที่ OUTPUTS_DIR/<ชื่อตามคอนเวนชั่นใน CLAUDE.md>",
+    "- แก้ไฟล์ data เสมอที่ DATA_DIR/<ชื่อไฟล์>",
+    "",
+    "กฎเรื่อง 'รายงานเสร็จ' (ป้องกันการอ้างผลที่ยังไม่เกิด):",
+    "- ห้ามตอบผู้ใช้ว่า 'เรียบร้อย/เสร็จแล้ว/บันทึกแล้ว' ก่อน verify ว่าไฟล์/แถวมีอยู่จริง",
+    "- หลัง Write/Edit เสร็จ ให้ตรวจซ้ำด้วย Bash ls หรือ Read tool ครั้งหนึ่ง",
+    "- ถ้า Write/Edit ผิดพลาด (เช่น path ไม่มีอยู่) ให้แก้ทันที อย่ารายงานว่าเสร็จ",
+    "",
     "หมายเหตุสำคัญ:",
     "- ถ้าผู้ใช้สั่งให้เพิ่ม/อัปเดต task ให้แก้ไฟล์ data/tasks.json ตรงๆ ผ่าน Edit/Write tool",
-    "- ถ้าผู้ใช้สั่งสร้างเอกสาร (invoice, รายงาน, JD, SOP) ให้เซฟไว้ที่ outputs/<ชื่อ>.md",
-    "- KPI scoreboard อยู่ที่ data/kpi.json — แก้ผ่าน Edit เมื่อมีตัวเลขเปลี่ยน",
+    "- ถ้าผู้ใช้สั่งสร้างเอกสาร (invoice, รายงาน, JD, SOP) ให้เซฟใน OUTPUTS_DIR",
+    "- KPI scoreboard อยู่ที่ DATA_DIR/kpi.json — แก้ผ่าน Edit เมื่อมีตัวเลขเปลี่ยน",
   );
 
   return sections.join("\n");

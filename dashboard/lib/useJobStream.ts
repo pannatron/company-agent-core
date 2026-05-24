@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { AgentQuestion } from "./agentQuestions";
 
 /**
  * Client-side mirror of JobRecord (kept in sync manually — server type lives
@@ -18,6 +19,15 @@ export interface ClientJob {
   finishedAt?: number;
   durationMs?: number;
   resultPreview?: string;
+  /** Server-side question detection — set when the agent's final reply is a
+   *  clarifying question / multi-choice question. The meeting room renders
+   *  the ❓ banner + Option chips from this when present, falling back to
+   *  scanning the truncated preview otherwise. */
+  awaitingAnswer?: AgentQuestion;
+  /** Live activity hint while running: latest text snippet, "ใช้ Bash",
+   *  "กำลังคิด…". Rendered under the spinner so the user can tell a
+   *  3-minute genuine task apart from a stuck one. */
+  currentActivity?: string;
   errorMessage?: string;
 }
 

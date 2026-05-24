@@ -3,6 +3,7 @@ import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { avatarUrl, getEmployee, EmployeeMeta } from "@/lib/employees";
 import { detectExplicitMention, routeMessage } from "@/lib/router";
 import { buildSystemPrompt } from "@/lib/buildSystemPrompt";
+import { detectAgentQuestion } from "@/lib/agentQuestions";
 import { REPO_ROOT, DATA_DIR } from "@/lib/repo";
 import { organize } from "@/lib/categorizer";
 import { promises as fsPromises } from "node:fs";
@@ -323,9 +324,14 @@ async function runTurnCore(args: TurnArgs, emit: EmitFn): Promise<void> {
           if (b.type === "text" && typeof b.text === "string") {
             emit({ type: "text", text: b.text });
             orderedBlocks.push({ kind: "text", text: b.text });
+            jobRegistry.progress(
+              jobId,
+              `📝 ${b.text.replace(/\s+/g, " ").trim().slice(0, 100)}`,
+            );
           } else if (b.type === "thinking" && typeof b.thinking === "string") {
             emit({ type: "thinking", text: b.thinking });
             orderedBlocks.push({ kind: "thinking", text: b.thinking });
+            jobRegistry.progress(jobId, "💭 กำลังคิด…");
           } else if (b.type === "tool_use") {
             const summary = summarizeToolInput(b.name ?? "", b.input ?? {});
             const toolBlock: Extract<ChatBlock, { kind: "tool" }> = {
@@ -344,6 +350,10 @@ async function runTurnCore(args: TurnArgs, emit: EmitFn): Promise<void> {
               input: b.input ?? {},
               summary,
             });
+            jobRegistry.progress(
+              jobId,
+              `⚙ ใช้ ${b.name ?? "tool"}${summary ? ` · ${summary.slice(0, 60)}` : ""}`,
+            );
           }
         }
       } else if (msg.type === "user") {
@@ -424,10 +434,23 @@ async function runTurnCore(args: TurnArgs, emit: EmitFn): Promise<void> {
     } catch {
       /* best-effort */
     }
-    // 4) Mark the cross-room job as finished so other tabs see the result
-    const firstText = orderedBlocks.find((b) => b.kind === "text");
-    const resultPreview =
-      firstText && firstText.kind === "text" ? firstText.text : undefined;
+    // 4) Mark the cross-room job as finished so other tabs see the result.
+    // Use the *last* text block, not the first — agents often open with
+    // "ขอเช็คก่อนครับ" / "ดูรูปก่อน" then do tool calls and only put the
+    // real answer (or follow-up question) in the final text block. That
+    // final block is what the user sees as the visible reply, so it's also
+    // what the meeting-room preview + question detector should run on.
+    const textBlocks = orderedBlocks.filter(
+      (b): b is Extract<ChatBlock, { kind: "text" }> => b.kind === "text",
+    );
+    const lastText = textBlocks[textBlocks.length - 1];
+    const resultPreview = lastText ? lastText.text : undefined;
+    // Run the question detector against the FULL last text block (not the
+    // truncated preview) so a clarifying question at char 1500 still
+    // surfaces a ❓ banner in the meeting room.
+    const awaitingAnswer = lastText
+      ? (detectAgentQuestion(lastText.text) ?? undefined)
+      : undefined;
     if (turnAborted) {
       jobRegistry.finish(jobId, { status: "aborted" });
     } else if (turnErrored) {
@@ -436,7 +459,11 @@ async function runTurnCore(args: TurnArgs, emit: EmitFn): Promise<void> {
         errorMessage: "การสนทนามีข้อผิดพลาด",
       });
     } else {
-      jobRegistry.finish(jobId, { status: "done", resultPreview });
+      jobRegistry.finish(jobId, {
+        status: "done",
+        resultPreview,
+        awaitingAnswer,
+      });
     }
   }
 }

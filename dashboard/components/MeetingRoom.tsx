@@ -14,7 +14,7 @@
  * chat — click "เปิดห้อง" on a card to jump there.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ACCENT_BG_SOFT,
   ACCENT_BORDER,
@@ -24,6 +24,7 @@ import {
 } from "@/lib/employees";
 import { summarizeAutoSync, useAutoSync } from "@/lib/useAutoSync";
 import { useJobStream, abortJob, type ClientJob } from "@/lib/useJobStream";
+import { detectAgentQuestion, type AgentQuestion } from "@/lib/agentQuestions";
 import Avatar from "./Avatar";
 import MentionTextarea from "./MentionTextarea";
 
@@ -76,6 +77,7 @@ interface Props {
 }
 
 const LS_TASK_ORDER = "meeting-room.dispatched-job-ids";
+const LS_ANSWERED_Q = "meeting-room.answered-questions";
 
 export default function MeetingRoom({
   seed,
@@ -90,6 +92,10 @@ export default function MeetingRoom({
   const [dispatching, setDispatching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  // jobIds whose "agent is asking the user a question" banner the user has
+  // already replied to (or dismissed). Persisted so the banner doesn't
+  // re-appear after a page refresh.
+  const [answeredQs, setAnsweredQs] = useState<Set<string>>(new Set());
   const endRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const autoSync = useAutoSync();
@@ -135,6 +141,28 @@ export default function MeetingRoom({
       /* ignore */
     }
   }, [tasks]);
+
+  // Hydrate already-answered question banners from localStorage.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(LS_ANSWERED_Q);
+      if (raw) {
+        const arr = JSON.parse(raw) as string[];
+        if (Array.isArray(arr)) setAnsweredQs(new Set(arr));
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const arr = Array.from(answeredQs).slice(-200);
+      localStorage.setItem(LS_ANSWERED_Q, JSON.stringify(arr));
+    } catch {
+      /* ignore */
+    }
+  }, [answeredQs]);
 
   // Once a task's job arrives from snapshot, backfill its prompt/respondent if
   // we only had a placeholder (e.g. after page refresh). Crucially, we bail
@@ -304,6 +332,90 @@ export default function MeetingRoom({
     }
   }
 
+  /** Reply to an agent's clarifying question right from the meeting room.
+   *  Loads recent direct-chat history so the agent keeps context, then
+   *  dispatches the answer back into the same direct room (which spawns a
+   *  fresh task card with the follow-up reply). */
+  async function submitInlineAnswer(task: Task, answer: string) {
+    const text = answer.trim();
+    if (!text) return;
+    const slug = task.respondent.slug;
+
+    // Mark answered immediately so the banner clears in UI even if the
+    // network round-trip is slow. We revert on failure below.
+    setAnsweredQs((cur) => {
+      const n = new Set(cur);
+      n.add(task.jobId);
+      return n;
+    });
+
+    let history: Array<{ role: "user" | "assistant"; content: string }> = [];
+    try {
+      const res = await fetch(`/api/chats/direct-${slug}?limit=30`);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data?.messages)) {
+          history = data.messages
+            .filter(
+              (m: { role?: string; content?: unknown }) =>
+                m &&
+                (m.role === "user" || m.role === "assistant") &&
+                typeof m.content === "string",
+            )
+            .map((m: { role: "user" | "assistant"; content: string }) => ({
+              role: m.role,
+              content: m.content,
+            }));
+        }
+      }
+    } catch {
+      /* fall through — agent will still get the bare answer */
+    }
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          employee: slug,
+          dispatch: true,
+          messages: [...history, { role: "user" as const, content: text }],
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${res.status}`);
+      }
+      const data = (await res.json()) as DispatchResponse;
+      const next: Task = {
+        jobId: data.job_id,
+        prompt: text,
+        respondent: data.respondent,
+        initialStatus: "queued",
+        dispatchedAt: Date.now(),
+      };
+      setTasks((cur) => [...cur, next]);
+    } catch (e) {
+      setError((e as Error).message);
+      // Revert so the user can retry.
+      setAnsweredQs((cur) => {
+        const n = new Set(cur);
+        n.delete(task.jobId);
+        return n;
+      });
+      throw e;
+    }
+  }
+
+  function dismissQuestion(jobId: string) {
+    setAnsweredQs((cur) => {
+      if (cur.has(jobId)) return cur;
+      const n = new Set(cur);
+      n.add(jobId);
+      return n;
+    });
+  }
+
   function clearBoard() {
     setTasks([]);
     try {
@@ -323,7 +435,11 @@ export default function MeetingRoom({
             {tasks.length > 0 && (
               <>
                 {" · "}
-                <ActiveCounter tasks={tasks} jobsById={jobsById} />
+                <ActiveCounter
+                  tasks={tasks}
+                  jobsById={jobsById}
+                  answeredQs={answeredQs}
+                />
               </>
             )}
           </span>
@@ -369,6 +485,9 @@ export default function MeetingRoom({
               task={t}
               job={jobsById.get(t.jobId)}
               onOpenDirect={onOpenDirect}
+              answered={answeredQs.has(t.jobId)}
+              onSubmitAnswer={(ans) => submitInlineAnswer(t, ans)}
+              onDismissQuestion={() => dismissQuestion(t.jobId)}
             />
           ))}
           {error && (
@@ -452,10 +571,16 @@ function TaskCard({
   task,
   job,
   onOpenDirect,
+  answered,
+  onSubmitAnswer,
+  onDismissQuestion,
 }: {
   task: Task;
   job: ClientJob | undefined;
   onOpenDirect: (slug: EmployeeSlug) => void;
+  answered: boolean;
+  onSubmitAnswer: (answer: string) => Promise<void>;
+  onDismissQuestion: () => void;
 }) {
   const status = job?.status ?? task.initialStatus;
   const accent = task.respondent.accent ?? "indigo";
@@ -471,6 +596,23 @@ function TaskCard({
     const id = setInterval(() => setElapsed(Date.now() - startedAt), 1000);
     return () => clearInterval(id);
   }, [status, job?.startedAt, task.dispatchedAt]);
+
+  // Prefer the server-side question detection (computed against the FULL
+  // final reply at finish time) over re-scanning the truncated preview —
+  // the preview can chop off questions that live past ~200 chars. Fall
+  // back to client-side detection for older jobs finished before the
+  // server started attaching `awaitingAnswer`.
+  const question: AgentQuestion | null = useMemo(() => {
+    if (status !== "done") return null;
+    if (job?.awaitingAnswer) return job.awaitingAnswer;
+    if (job?.resultPreview) return detectAgentQuestion(job.resultPreview);
+    return null;
+  }, [status, job?.awaitingAnswer, job?.resultPreview]);
+  const showQuestion = !!question && !answered;
+
+  // Used only for the option-chip click path — open-ended questions
+  // route the user into the direct room (no inline textarea here).
+  const [sendingAnswer, setSendingAnswer] = useState(false);
 
   // Prefer the real EmployeeMeta from the registry so the avatar uses the
   // same seed as everywhere else; fall back to a synthetic stub for
@@ -508,6 +650,14 @@ function TaskCard({
             {task.respondent.reason && (
               <span className={`pill ${chipBg}`}>↳ {task.respondent.reason}</span>
             )}
+            {showQuestion && (
+              <span
+                className="inline-flex items-center gap-1 rounded-full bg-warn/15 px-1.5 py-0.5 text-[10.5px] font-semibold text-warn"
+                title="เอเจ้นต์ตอบกลับเป็นคำถาม รอข้อมูลจากคุณ"
+              >
+                ❓ รอตอบ
+              </span>
+            )}
             <StatusPill status={status} elapsed={elapsed} job={job} className="ml-auto" />
           </div>
 
@@ -515,6 +665,16 @@ function TaskCard({
             <span className="text-ink-dim/60">› </span>
             {task.prompt}
           </p>
+
+          {/* Live activity hint while running — picks the latest text /
+              thinking / tool-use the agent emitted so a 3-minute genuine
+              task doesn't look identical to a stuck one. */}
+          {(status === "running" || status === "queued") &&
+            job?.currentActivity && (
+              <p className="mt-1 truncate rounded-md bg-accent-soft/10 px-2 py-1 text-[11px] text-accent">
+                {job.currentActivity}
+              </p>
+            )}
 
           {task.attachments && task.attachments.length > 0 && (
             <div className="mt-1.5 flex flex-wrap gap-1">
@@ -530,11 +690,86 @@ function TaskCard({
             </div>
           )}
 
-          {/* Result preview when done */}
-          {status === "done" && job?.resultPreview && (
+          {/* Result preview when done — suppressed when we show the
+              question banner instead (the banner already surfaces the
+              relevant snippet). */}
+          {status === "done" && job?.resultPreview && !showQuestion && (
             <p className="mt-2 line-clamp-3 rounded-md bg-surface-2/40 px-2.5 py-1.5 text-[12px] text-ink">
               {job.resultPreview}
             </p>
+          )}
+
+          {showQuestion && question && (
+            <div className="mt-2 rounded-md border border-warn/45 bg-warn/10 px-2.5 py-2">
+              <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px] font-semibold text-warn">
+                <span className="inline-flex items-center gap-1.5">
+                  <span>❓ ต้องการคำตอบจากคุณ</span>
+                  <span
+                    className="rounded-full bg-warn/20 px-1.5 py-[1px] text-[9px] font-normal text-warn/90"
+                    title="วลีที่ทำให้ระบบเดาว่าเป็นคำถาม"
+                  >
+                    {question.reason}
+                  </span>
+                </span>
+                <button
+                  onClick={onDismissQuestion}
+                  title="ไม่ใช่คำถาม / เป็นบวกผิด"
+                  className="rounded-full px-1.5 py-0.5 text-[10px] text-ink-dim/80 hover:text-danger"
+                >
+                  ✗
+                </button>
+              </div>
+              <p className="whitespace-pre-wrap text-[12.5px] leading-snug text-ink">
+                {question.question}
+              </p>
+
+              {question.options.length >= 2 ? (
+                // Multi-choice: each option becomes a one-click action.
+                // No textarea needed — clicking dispatches the choice
+                // back into the agent's direct room immediately.
+                <div className="mt-2 flex flex-col gap-1">
+                  <span className="text-[10px] uppercase tracking-wider text-warn/80">
+                    คลิกเพื่อเลือก (ทำงานทันที):
+                  </span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {question.options.map((opt) => (
+                      <button
+                        key={opt.label}
+                        onClick={() => {
+                          if (sendingAnswer) return;
+                          setSendingAnswer(true);
+                          void onSubmitAnswer(opt.answerText)
+                            .catch(() => {
+                              /* parent surfaces error */
+                            })
+                            .finally(() => setSendingAnswer(false));
+                        }}
+                        disabled={sendingAnswer}
+                        title={opt.answerText}
+                        className="flex max-w-full items-center gap-1.5 rounded-md border border-warn/50 bg-warn/15 px-2 py-1 text-left text-[11.5px] text-ink hover:bg-warn/25 disabled:opacity-40"
+                      >
+                        <span className="rounded bg-warn/30 px-1.5 py-0.5 font-mono text-[10px] font-bold text-warn">
+                          {opt.label}
+                        </span>
+                        <span className="truncate" title={opt.title}>
+                          {opt.title}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                // Open-ended: send the user to the direct room to compose
+                // their own reply — we no longer keep a textarea here.
+                <button
+                  onClick={() => onOpenDirect(task.respondent.slug)}
+                  className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-warn px-2.5 py-1.5 text-[11.5px] font-semibold text-bg shadow-sm hover:brightness-110"
+                  title={`เปิดห้องของ ${task.respondent.name.split(" ")[0]} เพื่อพิมพ์ตอบ`}
+                >
+                  💬 ไปตอบในห้อง {task.respondent.name.split(" ")[0]} →
+                </button>
+              )}
+            </div>
           )}
           {status === "error" && job?.errorMessage && (
             <p className="mt-2 rounded-md border border-danger/30 bg-danger/5 px-2.5 py-1.5 text-[11.5px] text-danger">
@@ -629,29 +864,63 @@ function StatusPill({
 function ActiveCounter({
   tasks,
   jobsById,
+  answeredQs,
 }: {
   tasks: Task[];
   jobsById: Map<string, ClientJob>;
+  answeredQs: Set<string>;
 }) {
   const counts = useMemo(() => {
     let active = 0;
     let done = 0;
+    let asking = 0;
     for (const t of tasks) {
       const j = jobsById.get(t.jobId);
       const s = j?.status ?? "queued";
       if (s === "running" || s === "queued") active++;
-      else if (s === "done") done++;
+      else if (s === "done") {
+        done++;
+        if (
+          !answeredQs.has(t.jobId) &&
+          (j?.awaitingAnswer || detectAgentQuestion(j?.resultPreview ?? null))
+        ) {
+          asking++;
+        }
+      }
     }
-    return { active, done };
-  }, [tasks, jobsById]);
-  if (counts.active === 0 && counts.done === 0) return null;
+    return { active, done, asking };
+  }, [tasks, jobsById, answeredQs]);
+  if (counts.active === 0 && counts.done === 0 && counts.asking === 0) return null;
+  const parts: ReactNode[] = [];
+  if (counts.active > 0) {
+    parts.push(
+      <span key="a" className="text-accent">
+        {counts.active} กำลังทำ
+      </span>,
+    );
+  }
+  if (counts.asking > 0) {
+    parts.push(
+      <span key="q" className="font-semibold text-warn">
+        ❓ {counts.asking} รอคำตอบ
+      </span>,
+    );
+  }
+  if (counts.done > 0) {
+    parts.push(
+      <span key="d" className="text-ok">
+        {counts.done} เสร็จ
+      </span>,
+    );
+  }
   return (
     <>
-      {counts.active > 0 && (
-        <span className="text-accent">{counts.active} กำลังทำ</span>
-      )}
-      {counts.active > 0 && counts.done > 0 && <span className="text-ink-dim"> · </span>}
-      {counts.done > 0 && <span className="text-ok">{counts.done} เสร็จ</span>}
+      {parts.map((p, i) => (
+        <span key={`w-${i}`}>
+          {i > 0 && <span className="text-ink-dim"> · </span>}
+          {p}
+        </span>
+      ))}
     </>
   );
 }

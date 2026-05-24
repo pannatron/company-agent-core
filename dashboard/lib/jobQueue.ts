@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import type { AgentQuestion } from "./agentQuestions";
 
 /**
  * In-memory job registry for parallel chat turns.
@@ -33,6 +34,21 @@ export interface JobRecord {
   durationMs?: number;
   /** First ~200 chars of the assistant's reply, set when status === "done". */
   resultPreview?: string;
+  /**
+   * Server-side question detection result, computed against the FULL final
+   * reply (not the truncated preview) at finish time. Lets the meeting
+   * room render the ❓ banner + Option chips reliably even when the
+   * question/options sit past the preview cutoff.
+   */
+  awaitingAnswer?: AgentQuestion;
+  /**
+   * Short live-activity hint while status === "running" — what the agent
+   * is doing *right now* (latest text snippet, "ใช้ Bash", "กำลังคิด").
+   * Lets the meeting room render "Lin: ⚙ ใช้ Edit" instead of an opaque
+   * 3-minute spinner, so the user can tell long tasks apart from stuck
+   * ones without clicking into the direct room.
+   */
+  currentActivity?: string;
   errorMessage?: string;
 }
 
@@ -91,10 +107,25 @@ class JobRegistry {
     this.emit({ type: "status", job });
   }
 
+  /** Update live activity on a running job and notify SSE subscribers.
+   *  No-op if the job is already finished/errored/aborted. */
+  progress(id: string, activity: string): void {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running") return;
+    const next = activity.trim().slice(0, 140);
+    if (job.currentActivity === next) return;
+    job.currentActivity = next;
+    this.emit({ type: "status", job });
+  }
+
   finish(
     id: string,
     outcome:
-      | { status: "done"; resultPreview?: string }
+      | {
+          status: "done";
+          resultPreview?: string;
+          awaitingAnswer?: AgentQuestion;
+        }
       | { status: "error"; errorMessage: string }
       | { status: "aborted" },
   ): void {
@@ -104,9 +135,18 @@ class JobRegistry {
     job.finishedAt = Date.now();
     job.durationMs = job.finishedAt - job.startedAt;
     if (outcome.status === "done") {
+      // Smart preview: keep an opening hint (~200 chars) AND the tail
+      // (~800 chars) with a "…" gap. Agents put conclusions and
+      // clarifying questions at the END of the reply (after tables,
+      // option lists, recommendations) — a naïve head-only truncate
+      // drops exactly the part the meeting room needs to surface as a
+      // ❓ banner. Tail-bias guarantees the question survives even on
+      // long replies (Alex's "Option A/B/C — แนะนำ X, จะเลือกไหน?"
+      // pattern is ~1500-2500 chars).
       job.resultPreview = outcome.resultPreview
-        ? truncate(outcome.resultPreview, 220)
+        ? smartPreview(outcome.resultPreview, 200, 800)
         : undefined;
+      job.awaitingAnswer = outcome.awaitingAnswer;
     } else if (outcome.status === "error") {
       job.errorMessage = outcome.errorMessage;
     }
@@ -166,11 +206,44 @@ function truncate(s: string, max: number): string {
 }
 
 /**
+ * Head-and-tail preview: short opening + full tail joined by "…". Used
+ * because agents finalize with a question/recommendation at the END of
+ * long replies, and a head-only truncate would drop it. We keep newlines
+ * around the "…" so the front-end's markdown render gives the gap some
+ * visual breathing room.
+ */
+function smartPreview(s: string, headChars: number, tailChars: number): string {
+  if (!s) return "";
+  // Collapse runs of spaces/tabs but PRESERVE newlines. The agent-question
+  // parser anchors options to line boundaries ("**Option A — ...**\n"),
+  // so flattening every \s into a single space would hide the structure
+  // and make A/B/C chips silently disappear.
+  const collapse = (x: string) => x.replace(/[ \t]+/g, " ");
+  const t = collapse(s).trim();
+  if (t.length <= headChars + tailChars + 3) return t;
+  const head = t.slice(0, headChars).trim();
+  const tail = t.slice(t.length - tailChars).trim();
+  return `${head}\n…\n${tail}`;
+}
+
+/**
  * Module-level singleton. Next.js may HMR this in dev — store on globalThis
  * so we keep one registry across reloads (otherwise active jobs vanish on
  * code edit).
+ *
+ * When the class shape changes (e.g. we add `progress()` here), the
+ * cached instance still points at the OLD prototype and would throw
+ * "x is not a function" until a full restart. Re-linking the prototype
+ * lets the cached instance pick up the new methods while preserving its
+ * jobs map + listeners + in-flight aborts. Safe because the instance's
+ * own fields are identical across versions — we only ever add methods.
  */
 const KEY = Symbol.for("company-agent-core.jobRegistry");
 type GlobalWithRegistry = typeof globalThis & { [KEY]?: JobRegistry };
 const g = globalThis as GlobalWithRegistry;
-export const jobRegistry: JobRegistry = g[KEY] ?? (g[KEY] = new JobRegistry());
+const cached = g[KEY];
+if (cached && !(cached instanceof JobRegistry)) {
+  Object.setPrototypeOf(cached, JobRegistry.prototype);
+}
+export const jobRegistry: JobRegistry =
+  cached ?? (g[KEY] = new JobRegistry());
