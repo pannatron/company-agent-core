@@ -63,6 +63,7 @@ interface Props {
 interface CardActions {
   onPostNow: (postId: string) => Promise<void>;
   onRetry: (postId: string) => Promise<void>;
+  onDelete: (post: Post) => Promise<void>;
   busyPostId: string | null;
 }
 
@@ -177,6 +178,47 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
     }
   };
 
+  /**
+   * Soft-delete a post from social-posts.json + push to Sheets. Refuses
+   * published posts unless the user explicitly confirms a second time, to
+   * keep the button safe for casual cleanup of drafts/scheduled.
+   */
+  const onDelete = async (post: Post) => {
+    const labelMap: Record<PostStatus, string> = {
+      draft: "draft",
+      ready_for_review: "รอ review",
+      approved: "approved",
+      scheduled: "ตั้งเวลา",
+      published: "เผยแพร่แล้ว",
+      failed: "ยิงไม่ออก",
+    };
+    const stTh = labelMap[post.status] ?? post.status;
+    const title = post.title || post.id;
+    if (!confirm(`ลบโพสต์นี้?\n\n[${stTh}] ${title}\n\nจะลบจาก social-posts.json + Sheets`)) {
+      return;
+    }
+    setBusyPostId(post.id);
+    setActionToast(null);
+    try {
+      const r = await fetch("/api/social", {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ post_id: post.id }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.ok === false) {
+        setActionToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+      } else {
+        setActionToast(
+          `✓ ลบโพสต์ "${title}" แล้ว${d.pushed ? " · sync Sheets แล้ว" : d.pushError ? ` · ⚠ push sheet ล้มเหลว: ${d.pushError}` : ""}`,
+        );
+        reload();
+      }
+    } finally {
+      setBusyPostId(null);
+    }
+  };
+
   const grouped = useMemo(() => {
     const out = new Map<string, Post[]>();
     if (!data) return out;
@@ -243,7 +285,7 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
                 key={col.key}
                 label={col.label}
                 posts={grouped.get(col.key) ?? []}
-                actions={{ onPostNow, onRetry, busyPostId }}
+                actions={{ onPostNow, onRetry, onDelete, busyPostId }}
               />
             ))}
           </div>
@@ -340,6 +382,10 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
         {post.copy}
       </p>
 
+      {post.asset_file && (
+        <AssetPreview path={post.asset_file} alt={post.title} />
+      )}
+
       {(post.scheduled_at || post.published_at) && (
         <p className="mt-1.5 text-[10px] text-ink-dim/80">
           {post.status === "published" && post.published_at
@@ -414,6 +460,19 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
               {actions.busyPostId === post.id ? "…" : "↻ Retry"}
             </button>
           )}
+          {/* Delete — visible for everything except already-published posts.
+              Drafts/scheduled/failed get a one-click cleanup; published is
+              skipped here on purpose (use Facebook directly for that). */}
+          {post.status !== "published" && (
+            <button
+              onClick={() => actions.onDelete(post)}
+              disabled={actions.busyPostId === post.id}
+              title="ลบโพสต์นี้ออกจากระบบ + Sheets (ไม่กระทบ Facebook)"
+              className="rounded border border-rose-400/40 bg-rose-500/10 px-1.5 py-0.5 text-[10px] text-rose-200 hover:border-rose-300 disabled:opacity-50"
+            >
+              {actions.busyPostId === post.id ? "…" : "🗑"}
+            </button>
+          )}
           {post.external_url ? (
             <a
               href={post.external_url}
@@ -431,6 +490,58 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * Render the post's image asset (or a file chip if it's a non-image).
+ * `path` comes from social-posts.json as something like
+ *   "outputs/content/foo.png" — the `/api/outputs/file/[...path]` route
+ * mounts UNDER outputs/, so we strip the leading "outputs/" before
+ * building the URL. Hide the element on load error so a stale row
+ * pointing at a missing file doesn't show a broken-image icon.
+ */
+function AssetPreview({ path, alt }: { path: string; alt?: string }) {
+  const [hidden, setHidden] = useState(false);
+  const isImage = /\.(png|jpe?g|webp|gif|avif|heic|heif)$/i.test(path);
+  const stripped = path.replace(/^outputs\//, "");
+  const url =
+    "/api/outputs/file/" +
+    stripped.split("/").map(encodeURIComponent).join("/");
+  if (hidden) return null;
+  if (!isImage) {
+    return (
+      <div className="mt-2 flex items-center gap-1.5 rounded-md border border-border bg-surface-2/40 px-2 py-1 text-[10px] text-ink-dim">
+        <span>📎</span>
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          className="truncate hover:text-accent"
+          title={path}
+        >
+          {path.split("/").pop()}
+        </a>
+      </div>
+    );
+  }
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noreferrer"
+      className="mt-2 block overflow-hidden rounded-md border border-border bg-surface-2/40"
+      title="คลิกเพื่อเปิดรูปต้นฉบับ"
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={url}
+        alt={alt || path}
+        loading="lazy"
+        className="block max-h-[200px] w-full object-cover"
+        onError={() => setHidden(true)}
+      />
+    </a>
   );
 }
 
