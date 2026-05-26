@@ -682,9 +682,16 @@ export function extractFolderId(url: string): string | null {
 export function buildAppsScriptTemplate(targetFolderId?: string): string {
   const baked = (targetFolderId ?? "").trim();
   return `/**
- * Virtual AI Company — Drive Sync receiver  (v8)
+ * Virtual AI Company — Drive Sync receiver  (v10)
  *
- * What's new in v8:
+ * What's new in v10:
+ *   - 🔒 FIX duplicate post bug: trigger overlap ทำให้แถวเดียวถูกยิง 2 ครั้ง
+ *     a) LockService.getScriptLock() กั้น run ซ้อนกัน
+ *     b) Row-level lock: เขียน status="publishing" + sheet.flush() ก่อน FB call
+ *        — ถ้า trigger ที่ 2 เข้ามาตอนแรกยังไม่จบ จะเห็น status="publishing"
+ *        แล้ว skip แถวนั้นแทนที่จะยิงซ้ำ
+ *
+ * v8:
  *   - Diagnostic writeback: every scheduler run records last_attempt_at,
  *     attempt_count, error_log on the Sheet row (BUG-003 fix). After 3
  *     attempts the row is auto-marked status=failed.
@@ -702,7 +709,7 @@ export function buildAppsScriptTemplate(targetFolderId?: string): string {
  *      (URL เดิม /exec ใช้ต่อได้ ไม่ต้องเปลี่ยน)
  */
 
-const SCRIPT_VERSION = "8";
+const SCRIPT_VERSION = "10";
 const MAX_ATTEMPTS = 3;
 const BACKUP_FOLDER_NAME = "⚙ Setup Backup";
 const FB_TRIGGER_FN = "runFbScheduler";
@@ -1160,6 +1167,23 @@ function runFbScheduler() {
 }
 
 function runFbSchedulerImpl_() {
+  // v10 — กั้น trigger ซ้อนกัน ป้องกันโพสต์ซ้ำ
+  // ถ้าอีก run หนึ่งกำลังทำงานอยู่ ไม่รอ — return เลย รอ tick ถัดไป
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(2000)) {
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty("FB_LAST_RUN_AT", new Date().toISOString());
+    props.setProperty("FB_LAST_RESULT", "skipped — another run in progress");
+    return { published: 0, errors: 0, skipped: 0, note: "concurrent run" };
+  }
+  try {
+    return runFbSchedulerCore_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function runFbSchedulerCore_() {
   const props = PropertiesService.getScriptProperties();
   const cfg = fbConfig_();
   if (!cfg.page_id || !cfg.page_token) {
@@ -1195,7 +1219,6 @@ function runFbSchedulerImpl_() {
   let published = 0;
   let errors = 0;
   let skipped = 0;
-  const updates = [];
 
   for (var r = 1; r < all.length; r++) {
     const row = all[r];
@@ -1206,6 +1229,8 @@ function runFbSchedulerImpl_() {
       continue;
     }
     if (status !== "scheduled") {
+      // v10: ถ้าเจอ "publishing" ค้างก็ skip — แสดงว่ามี run อื่นกำลังจัดการ
+      // (หลุดออกจาก lock ก็ได้แค่ run ถัดไปจะเห็นและทิ้งให้ค้าง — แก้มือผ่าน retry)
       skipped++;
       continue;
     }
@@ -1218,15 +1243,23 @@ function runFbSchedulerImpl_() {
     const prevAttempts = cols.iAttemptCount >= 0 ? parseInt(String(row[cols.iAttemptCount] || "0"), 10) || 0 : 0;
     const message = String(row[cols.iCopy] || "").trim();
     if (!message) {
-      updates.push(buildFailureUpdate_(r, prevAttempts, "ไม่มี copy"));
+      applyRowUpdates_(sheet, cols, [buildFailureUpdate_(r, prevAttempts, "ไม่มี copy")]);
       errors++;
       continue;
     }
+
+    // v10: Row-level lock — เขียน status="publishing" + flush ก่อนเรียก FB
+    // ป้องกัน trigger อื่น (ถ้าหลุด LockService) เห็นแถวเดียวกันเป็น scheduled แล้วยิงซ้ำ
+    if (cols.iStatus >= 0) {
+      sheet.getRange(r + 1, cols.iStatus + 1).setValue("publishing");
+      SpreadsheetApp.flush();
+    }
+
     try {
       const driveId = cols.iAssetDriveId >= 0 ? String(row[cols.iAssetDriveId] || "") : "";
       const assetUrl = cols.iAssetUrl >= 0 ? String(row[cols.iAssetUrl] || "") : "";
       const url = publishToFb_(cfg, message, assetUrl, driveId);
-      updates.push({
+      applyRowUpdates_(sheet, cols, [{
         row: r,
         status: "published",
         external_url: url,
@@ -1235,15 +1268,13 @@ function runFbSchedulerImpl_() {
         last_attempt_at: new Date().toISOString(),
         attempt_count: prevAttempts + 1,
         error_log: "",
-      });
+      }]);
       published++;
     } catch (e) {
-      updates.push(buildFailureUpdate_(r, prevAttempts, String(e)));
+      applyRowUpdates_(sheet, cols, [buildFailureUpdate_(r, prevAttempts, String(e))]);
       errors++;
     }
   }
-
-  applyRowUpdates_(sheet, cols, updates);
 
   props.setProperty("FB_LAST_RUN_AT", now.toISOString());
   props.setProperty("FB_LAST_RESULT", "published=" + published + " errors=" + errors + " skipped=" + skipped);
@@ -1310,8 +1341,22 @@ function applyRowUpdates_(sheet, cols, updates) {
 /**
  * Publish a single row right now, bypassing the time trigger (BUG-004).
  * Same writeback semantics as the scheduler so the Sheet stays consistent.
+ * v10: LockService + row-level "publishing" lock — กัน scheduler trigger
+ * ยิงซ้ำเวลา user กดปุ่ม "post now" ขณะ cron กำลัง run อยู่
  */
 function fbPostNowImpl_(postId) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    return { ok: false, error: "อีก run หนึ่งกำลังทำงาน — ลองอีก 5 วินาที", post_id: postId };
+  }
+  try {
+    return fbPostNowCore_(postId);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function fbPostNowCore_(postId) {
   const cfg = fbConfig_();
   if (!cfg.page_id || !cfg.page_token) {
     return { ok: false, error: "ตั้ง FB Page ID + Token ก่อน" };
@@ -1330,9 +1375,27 @@ function fbPostNowImpl_(postId) {
   }
   if (rowIdx < 0) return { ok: false, error: "ไม่พบ post_id: " + postId };
   const row = all[rowIdx - 1];
+
+  // v10: เช็คก่อนยิง — ถ้า status เป็น published/publishing แล้ว ห้ามยิงซ้ำ
+  const curStatus = cols.iStatus >= 0 ? String(row[cols.iStatus] || "").toLowerCase() : "";
+  if (curStatus === "published") {
+    const existingUrl = cols.iExternal >= 0 ? String(row[cols.iExternal] || "") : "";
+    return { ok: false, error: "โพสต์นี้ published แล้ว — ป้องกันยิงซ้ำ", external_url: existingUrl, post_id: postId };
+  }
+  if (curStatus === "publishing") {
+    return { ok: false, error: "โพสต์นี้กำลัง publish อยู่ — รอสักครู่", post_id: postId };
+  }
+
   const message = String(row[cols.iCopy] || "").trim();
   if (!message) return { ok: false, error: "post นี้ไม่มี copy" };
   const prevAttempts = cols.iAttemptCount >= 0 ? parseInt(String(row[cols.iAttemptCount] || "0"), 10) || 0 : 0;
+
+  // v10: Row-level lock
+  if (cols.iStatus >= 0) {
+    sheet.getRange(rowIdx + 1, cols.iStatus + 1).setValue("publishing");
+    SpreadsheetApp.flush();
+  }
+
   try {
     const driveId = cols.iAssetDriveId >= 0 ? String(row[cols.iAssetDriveId] || "") : "";
     const assetUrl = cols.iAssetUrl >= 0 ? String(row[cols.iAssetUrl] || "") : "";

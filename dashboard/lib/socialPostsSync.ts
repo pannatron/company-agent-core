@@ -63,6 +63,7 @@ export const POST_STATUSES = [
   "ready_for_review",
   "approved",
   "scheduled",
+  "publishing",
   "published",
   "failed",
 ] as const;
@@ -372,7 +373,90 @@ export function validatePosts(posts: Post[]): ValidationIssue[] {
           "image post needs asset_file (local path) or asset_url (public URL) — Apps Script will skip otherwise",
       });
     }
+
+    // Raw upload guard: block posts that point at outputs/uploads/ directly.
+    // The uploads folder is the raw drop zone (timestamp filenames). Agents
+    // must rename/move to outputs/content/ AND resize to -web.jpg before push,
+    // otherwise FB gets a multi-MB phone photo with no edit pass.
+    // Only enforced for posts going live — drafts can keep placeholder paths.
+    const isGoingLive = p.status === "scheduled" || p.status === "approved";
+    if (isGoingLive && p.asset_file && /(^|\/)outputs\/uploads\//.test(p.asset_file)) {
+      issues.push({
+        post_id: ref,
+        field: "asset_file",
+        message:
+          `asset_file ชี้ไปที่ outputs/uploads/ — รูปดิบที่ยังไม่ผ่าน resize ห้ามโพสต์ตรงๆ. ` +
+          `ให้รัน playbook "prepare-fb-image" (cp + resize -Z 1080 → -web.jpg) แล้วชี้ asset_file ไปที่ outputs/content/...-web.jpg`,
+      });
+    }
   });
+
+  return issues;
+}
+
+/**
+ * File-system guard: open each scheduled/approved post's image and reject if
+ * it looks like a raw, unprocessed asset. Agents have a documented habit of
+ * skipping the resize step and posting 4-MB phone photos straight to FB —
+ * this is the stop sign.
+ *
+ * Heuristics (all path/size-based, no image decode):
+ *  - Filename should contain "-web" (the convention from playbook entry
+ *    `resize-image-web-1080`). Missing → block.
+ *  - File size > 1.5 MB → block (a properly resized 1080px JPG q85 is ~150-600 KB).
+ *
+ * Only checks posts about to go live (status scheduled/approved) with a local
+ * asset_file. Missing files are NOT this function's concern — collectMissing()
+ * already covers that.
+ */
+export async function validateAssetProcessed(posts: Post[]): Promise<ValidationIssue[]> {
+  const issues: ValidationIssue[] = [];
+  const REPO_ROOT = path.resolve(DATA_DIR, "..");
+  const MAX_BYTES = 1_500_000;
+
+  for (const p of posts) {
+    const willGoLive = p.status === "scheduled" || p.status === "approved";
+    if (!willGoLive) continue;
+    if (!p.asset_file) continue;
+    // skip remote URLs — those are caller's responsibility
+    if (/^https?:\/\//i.test(p.asset_file)) continue;
+
+    const abs = path.isAbsolute(p.asset_file)
+      ? p.asset_file
+      : path.join(REPO_ROOT, p.asset_file);
+    let size = 0;
+    try {
+      const st = await fs.stat(abs);
+      size = st.size;
+    } catch {
+      continue; // missing file — let collectMissing report it
+    }
+
+    const base = path.basename(p.asset_file).toLowerCase();
+    const isImage = /\.(jpe?g|png|webp|gif|heic)$/i.test(base);
+    if (!isImage) continue;
+
+    if (!base.includes("-web")) {
+      issues.push({
+        post_id: p.id,
+        field: "asset_file",
+        message:
+          `รูปยังไม่ผ่าน resize — ชื่อไฟล์ "${base}" ไม่มี suffix "-web". ` +
+          `รัน playbook "prepare-fb-image" เพื่อทำ cp + resize -Z 1080 → -web.jpg ก่อนค่อยชี้ asset_file ใหม่`,
+      });
+      continue; // one issue per post is enough
+    }
+
+    if (size > MAX_BYTES) {
+      issues.push({
+        post_id: p.id,
+        field: "asset_file",
+        message:
+          `รูปใหญ่เกิน (${(size / 1024 / 1024).toFixed(1)} MB > 1.5 MB) — น่าจะเป็นภาพดิบที่ยังไม่ถูก compress. ` +
+          `รัน playbook "resize-image-web-1080" (sips -Z 1080 -s formatOptions 85) แล้วใช้ไฟล์ -web.jpg แทน`,
+      });
+    }
+  }
 
   return issues;
 }
@@ -440,6 +524,11 @@ export async function pushSocialPosts(): Promise<{
   const issues = validatePosts(data.posts);
   if (issues.length > 0) {
     throw new SocialPostValidationError(issues);
+  }
+
+  const assetProcessedIssues = await validateAssetProcessed(data.posts);
+  if (assetProcessedIssues.length > 0) {
+    throw new SocialPostValidationError(assetProcessedIssues);
   }
 
   // BUG-006: Catch posts that are about to be published but whose image asset
