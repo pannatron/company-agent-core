@@ -1,0 +1,13 @@
+http:
+  routers:
+    company-agent:
+      entryPoints:
+        - http
+      rule: "Host(`__DOMAIN__`)"
+      service: company-agent
+  services:
+    company-agent:
+      loadBalancer:
+        servers:
+          - url: "http://10.0.1.1:3508"
+        passHostHeader: true
