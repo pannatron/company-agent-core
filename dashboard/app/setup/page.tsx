@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   CompanyProfile,
@@ -10,6 +10,13 @@ import {
 
 type Step = 1 | 2 | 3 | 4;
 
+interface LogoInfo {
+  exists: boolean;
+  ext?: string;
+  size?: number;
+  updated_at?: string;
+}
+
 export default function SetupPage() {
   const router = useRouter();
   const [profile, setProfile] = useState<CompanyProfile>(emptyProfile());
@@ -18,15 +25,57 @@ export default function SetupPage() {
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
 
-  // Load existing profile (allow re-run of setup to edit)
+  const [logo, setLogo] = useState<LogoInfo>({ exists: false });
+  const [logoBusy, setLogoBusy] = useState(false);
+  const [logoError, setLogoError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Load existing profile + logo (allow re-run of setup to edit)
   useEffect(() => {
-    fetch("/api/setup")
-      .then((r) => r.json())
-      .then((d: { complete: boolean; profile: CompanyProfile }) => {
-        if (d.profile) setProfile({ ...emptyProfile(), ...d.profile });
-      })
-      .finally(() => setLoaded(true));
+    Promise.all([
+      fetch("/api/setup")
+        .then((r) => r.json())
+        .then((d: { complete: boolean; profile: CompanyProfile }) => {
+          if (d.profile) setProfile({ ...emptyProfile(), ...d.profile });
+        }),
+      fetch("/api/brand/logo?info=1")
+        .then((r) => (r.ok ? r.json() : { exists: false }))
+        .then((info: LogoInfo) => setLogo(info))
+        .catch(() => setLogo({ exists: false })),
+    ]).finally(() => setLoaded(true));
   }, []);
+
+  async function onLogoSelected(file: File) {
+    setLogoError(null);
+    setLogoBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch("/api/brand/logo", { method: "POST", body: fd });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "อัปโหลดล้มเหลว");
+      setLogo({ exists: true, ext: data.ext, size: data.size, updated_at: data.updated_at });
+    } catch (e) {
+      setLogoError((e as Error).message);
+    } finally {
+      setLogoBusy(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  async function removeLogo() {
+    setLogoError(null);
+    setLogoBusy(true);
+    try {
+      const res = await fetch("/api/brand/logo", { method: "DELETE" });
+      if (!res.ok) throw new Error("ลบโลโก้ไม่สำเร็จ");
+      setLogo({ exists: false });
+    } catch (e) {
+      setLogoError((e as Error).message);
+    } finally {
+      setLogoBusy(false);
+    }
+  }
 
   function update<K extends keyof CompanyProfile>(k: K, v: CompanyProfile[K]) {
     setProfile((p) => ({ ...p, [k]: v }));
@@ -76,7 +125,16 @@ export default function SetupPage() {
     <main className="min-h-screen px-4 py-10">
       <div className="mx-auto max-w-2xl">
         <header className="mb-8 text-center">
-          <div className="mx-auto mb-3 h-12 w-12 rounded-xl bg-gradient-to-br from-accent to-accent-soft" />
+          {logo.exists ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={`/api/brand/logo?t=${logo.updated_at ?? ""}`}
+              alt="logo"
+              className="mx-auto mb-3 h-12 w-12 rounded-xl border border-border object-cover"
+            />
+          ) : (
+            <div className="mx-auto mb-3 h-12 w-12 rounded-xl bg-gradient-to-br from-accent to-accent-soft" />
+          )}
           <h1 className="text-2xl font-semibold text-ink">
             ตั้งค่าบริษัทเสมือนของคุณ
           </h1>
@@ -90,6 +148,52 @@ export default function SetupPage() {
         <div className="card p-6">
           {step === 1 && (
             <Section title="1. ข้อมูลบริษัท" subtitle="ชื่อ และประเภทธุรกิจที่คุณทำอยู่">
+              <Field label="โลโก้บริษัท (ไม่บังคับ)">
+                <div className="flex items-center gap-4 rounded-lg border border-border bg-surface-2/40 p-3">
+                  <LogoPreview logo={logo} />
+                  <div className="flex-1 space-y-1.5">
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) onLogoSelected(f);
+                      }}
+                    />
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={logoBusy}
+                        className="rounded-lg border border-border bg-surface px-3 py-1.5 text-xs font-medium text-ink hover:border-accent disabled:opacity-50"
+                      >
+                        {logoBusy
+                          ? "กำลังอัปโหลด…"
+                          : logo.exists
+                            ? "เปลี่ยนโลโก้"
+                            : "เลือกไฟล์โลโก้"}
+                      </button>
+                      {logo.exists && !logoBusy && (
+                        <button
+                          type="button"
+                          onClick={removeLogo}
+                          className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-1.5 text-xs font-medium text-danger hover:bg-danger/20"
+                        >
+                          ลบโลโก้
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-ink-dim">
+                      PNG / JPG / WEBP / SVG ขนาดไม่เกิน 5 MB — แนะนำสี่เหลี่ยมจัตุรัส 256×256 ขึ้นไป
+                    </p>
+                    {logoError && (
+                      <p className="text-[11px] text-danger">{logoError}</p>
+                    )}
+                  </div>
+                </div>
+              </Field>
               <Field label="ชื่อบริษัท *">
                 <input
                   className="input"
@@ -484,6 +588,24 @@ function Field({
       </span>
       {children}
     </label>
+  );
+}
+
+function LogoPreview({ logo }: { logo: LogoInfo }) {
+  if (logo.exists) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        src={`/api/brand/logo?t=${logo.updated_at ?? ""}`}
+        alt="logo preview"
+        className="h-16 w-16 shrink-0 rounded-lg border border-border bg-surface object-cover"
+      />
+    );
+  }
+  return (
+    <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-lg border-2 border-dashed border-border bg-surface/50 text-[10px] uppercase text-ink-dim">
+      ไม่มี
+    </div>
   );
 }
 
