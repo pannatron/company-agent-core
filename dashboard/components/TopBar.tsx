@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { CompanyProfile } from "@/lib/companyProfile";
 import { formatNumber, KpiItem, kpiStatusColor, pctOfTarget } from "./kpi-utils";
 
@@ -29,6 +30,15 @@ export default function TopBar({
   onView,
   onReconfigure,
 }: Props) {
+  const router = useRouter();
+  const goOffice = () => {
+    try {
+      localStorage.setItem("ui.mode", "office");
+    } catch {
+      /* ignore */
+    }
+    router.push("/office");
+  };
   // Surface only KPIs that need attention (worst first, max 2)
   const alerts = kpis
     .filter((k) => k.status === "off_track" || k.status === "at_risk")
@@ -106,6 +116,16 @@ export default function TopBar({
           alerts.map((k) => <KpiAlert key={k.id} k={k} />)
         )}
       </div>
+
+      {/* Mode switcher — jump to Office simulation */}
+      <button
+        onClick={goOffice}
+        title="สลับไปโหมด Office (จำลอง)"
+        className="hidden items-center gap-1.5 rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-xs text-ink-dim hover:border-accent hover:text-ink sm:flex"
+      >
+        <span>🏢</span>
+        <span>Office mode</span>
+      </button>
 
       {/* Settings */}
       <button

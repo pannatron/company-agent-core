@@ -37,6 +37,14 @@ export default function HomePage() {
     try {
       setSidebarCollapsed(localStorage.getItem("ui.sidebarCollapsed") === "1");
       setRailCollapsed(localStorage.getItem("ui.railCollapsed") === "1");
+      // Honor a pending direct-chat handoff from Office mode.
+      const pending = localStorage.getItem("ui.openDirect");
+      if (pending) {
+        localStorage.removeItem("ui.openDirect");
+        setDirect(pending);
+        setView("meeting");
+      }
+      localStorage.setItem("ui.mode", "dashboard");
     } catch {
       /* ignore */
     }
