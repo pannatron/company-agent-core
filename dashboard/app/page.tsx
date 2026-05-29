@@ -10,7 +10,13 @@ import TaskBoardView from "@/components/TaskBoard";
 import SocialView from "@/components/SocialView";
 import KpiPanel from "@/components/KpiPanel";
 import FilesView from "@/components/FilesView";
+import DataView from "@/components/DataView";
 import JobTicker from "@/components/JobTicker";
+import {
+  ReviewBanner,
+  ReviewModal,
+  type ReviewSummary,
+} from "@/components/ReviewModal";
 import { EmployeeMeta, EMPLOYEES, EmployeeSlug } from "@/lib/employees";
 import { KpiFile, KpiItem } from "@/components/kpi-utils";
 import { CompanyProfile } from "@/lib/companyProfile";
@@ -110,10 +116,37 @@ export default function HomePage() {
     }
   }, []);
 
+  // Global review state — banner+modal shown across every view whenever the
+  // AI has edited a reviewable file and the user hasn't confirmed yet.
+  const [review, setReview] = useState<ReviewSummary | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const refreshReview = useCallback(async () => {
+    try {
+      const res = await fetch("/api/data/review");
+      const data = (await res.json()) as ReviewSummary;
+      setReview(data);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  useEffect(() => {
+    refreshReview();
+    const onFocus = () => refreshReview();
+    window.addEventListener("focus", onFocus);
+    // Poll every 6s so edits made by a background dispatch show up without a
+    // manual refresh. Cheap — the endpoint is a few file stats + a diff.
+    const t = setInterval(refreshReview, 6000);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      clearInterval(t);
+    };
+  }, [refreshReview]);
+
   const onAgentTurn = useCallback(() => {
     setTasksRefresh((n) => n + 1);
     refreshKpi();
-  }, [refreshKpi]);
+    refreshReview();
+  }, [refreshKpi, refreshReview]);
 
   // Subscribe to job stream at the page level so the sidebar can highlight
   // and reorder employees that are currently running a turn.
@@ -147,7 +180,10 @@ export default function HomePage() {
   };
 
   return (
-    <main className="grid h-screen grid-rows-[auto_1fr] bg-bg">
+    <>
+      <main
+        className={`grid h-screen ${review?.pending ? "grid-rows-[auto_auto_1fr]" : "grid-rows-[auto_1fr]"} bg-bg`}
+      >
       <TopBar
         company={company}
         kpis={kpis}
@@ -155,6 +191,10 @@ export default function HomePage() {
         onView={setView}
         onReconfigure={() => router.push("/setup")}
       />
+
+      {review?.pending && (
+        <ReviewBanner review={review} onOpen={() => setReviewOpen(true)} />
+      )}
 
       <div
         className="grid min-h-0"
@@ -240,6 +280,8 @@ export default function HomePage() {
             <KpiPanel kpis={kpis} updatedAt={kpiUpdated} fullScreen />
           )}
 
+          {view === "data" && <DataView />}
+
           {view === "files" && <FilesView />}
         </div>
 
@@ -251,6 +293,15 @@ export default function HomePage() {
         />
       </div>
     </main>
+    {review && (
+      <ReviewModal
+        open={reviewOpen}
+        review={review}
+        onClose={() => setReviewOpen(false)}
+        onRefresh={refreshReview}
+      />
+    )}
+  </>
   );
 }
 

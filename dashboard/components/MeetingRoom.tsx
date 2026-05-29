@@ -249,13 +249,14 @@ export default function MeetingRoom({
     return () => clearTimeout(t);
   }, [toast]);
 
-  async function uploadFiles(fl: FileList | null) {
-    if (!fl?.length) return;
+  async function uploadFiles(fl: FileList | File[] | null) {
+    if (!fl || (fl as { length?: number }).length === 0) return;
     setUploading(true);
     setError(null);
     try {
       const uploaded: Attachment[] = [];
-      for (const file of Array.from(fl)) {
+      const files = Array.from(fl as ArrayLike<File>);
+      for (const file of files) {
         const fd = new FormData();
         fd.append("file", file);
         const res = await fetch("/api/upload", { method: "POST", body: fd });
@@ -274,6 +275,23 @@ export default function MeetingRoom({
 
   function removePending(p: string) {
     setPendingFiles((c) => c.filter((f) => f.path !== p));
+  }
+
+  /** Paste-to-attach: pull image File objects out of clipboardData and
+   *  funnel them through the same upload flow as the paperclip button. */
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData?.items;
+    if (!items?.length) return;
+    const files: File[] = [];
+    for (const item of Array.from(items)) {
+      if (item.kind === "file") {
+        const f = item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length === 0) return;
+    e.preventDefault();
+    void uploadFiles(files);
   }
 
   async function dispatch(overrideText?: string) {
@@ -542,7 +560,8 @@ export default function MeetingRoom({
               value={input}
               onChange={setInput}
               onSubmit={dispatch}
-              placeholder="สั่งงาน… พิมพ์ @ เพื่อเลือกคน  ·  ส่งงานต่อได้ทันที ไม่ต้องรอคนก่อนหน้าจบ"
+              onPaste={handlePaste}
+              placeholder="สั่งงาน… พิมพ์ @ เพื่อเลือกคน · แปะรูปได้ · ส่งงานต่อได้ทันที"
               rows={2}
               className="input min-h-[52px] flex-1 w-full"
               disabled={false}

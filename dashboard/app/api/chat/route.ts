@@ -10,6 +10,7 @@ import { promises as fsPromises } from "node:fs";
 import nodePath from "node:path";
 import { pushSocialPosts } from "@/lib/socialPostsSync";
 import { jobRegistry } from "@/lib/jobQueue";
+import { ensureReviewCheckpoint } from "@/lib/driveSync";
 import {
   ChatAttachment,
   ChatBlock,
@@ -290,6 +291,16 @@ async function runTurnCore(args: TurnArgs, emit: EmitFn): Promise<void> {
     socialMtimeAtStart = (await fsPromises.stat(socialPostsPath)).mtimeMs;
   } catch {
     /* file doesn't exist yet */
+  }
+
+  // Capture a "before AI" checkpoint so the user can review/revert any edits
+  // the agent makes to reviewable data files (employees, finance, etc.). Only
+  // takes a fresh snapshot if no pending review exists — multiple chats stack
+  // into the same review until the user accepts/reverts.
+  try {
+    await ensureReviewCheckpoint(`chat:${chatId}`);
+  } catch {
+    /* checkpointing must never block the turn */
   }
 
   jobRegistry.markRunning(jobId);

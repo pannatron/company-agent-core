@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { CompanyProfile } from "@/lib/companyProfile";
 import { formatNumber, KpiItem, kpiStatusColor, pctOfTarget } from "./kpi-utils";
 
-export type ViewKey = "meeting" | "tasks" | "social" | "kpi" | "files";
+export type ViewKey = "meeting" | "tasks" | "social" | "kpi" | "data" | "files";
 
 interface Props {
   company: CompanyProfile;
@@ -19,7 +19,8 @@ const TABS: { key: ViewKey; label: string; icon: string }[] = [
   { key: "meeting", label: "Meeting", icon: "🏛" },
   { key: "tasks", label: "Tasks", icon: "📋" },
   { key: "social", label: "Social", icon: "📱" },
-  { key: "kpi", label: "KPI", icon: "📊" },
+  { key: "kpi", label: "KPI", icon: "📈" },
+  { key: "data", label: "Data", icon: "📊" },
   { key: "files", label: "Files", icon: "📁" },
 ];
 

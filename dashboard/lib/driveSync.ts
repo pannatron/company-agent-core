@@ -246,15 +246,24 @@ async function* walkOutputs(dir: string): AsyncGenerator<string> {
   }
 }
 
-export async function syncAll(): Promise<SyncResult> {
+export async function syncAll(opts?: {
+  /** Optional whitelist of outputs/-relative paths. When set, only these
+   *  files get walked/uploaded — the rest are skipped without comment.
+   *  Used by the review modal so user-confirmed files are the only ones
+   *  that ship to Drive. */
+  paths?: string[];
+}): Promise<SyncResult> {
   const cfg = await loadConfig();
   if (!cfg) throw new Error("Drive ยังไม่ได้เชื่อม");
 
   const state = await loadState();
   const result: SyncResult = { uploaded: [], updated: [], skipped: [], errors: [] };
+  const allowList = opts?.paths ? new Set(opts.paths) : null;
 
   for await (const full of walkOutputs(OUTPUTS_DIR)) {
     const repoRel = path.relative(REPO_ROOT, full).split(path.sep).join("/");
+    const outputsRel = path.relative(OUTPUTS_DIR, full).split(path.sep).join("/");
+    if (allowList && !allowList.has(outputsRel)) continue;
     try {
       const rel = path.relative(OUTPUTS_DIR, full).split(path.sep);
       const categoryId = rel.length > 1 ? rel[0] : "misc";
@@ -376,6 +385,35 @@ export async function getSyncedMap(): Promise<Record<string, FileSyncEntry>> {
 /** Backup folder name on Drive (must match Apps Script's BACKUP_FOLDER_NAME) */
 const BACKUP_CATEGORY = "⚙ Setup Backup";
 const BACKUP_STATE_PATH = path.join(REPO_ROOT, "data", ".backup-state.json");
+const HISTORY_DIR = path.join(REPO_ROOT, "data", ".backup-history");
+const HISTORY_KEEP = 10;
+const REVIEW_STATE_PATH = path.join(REPO_ROOT, "data", ".review-state.json");
+
+/**
+ * Files surfaced to the user for review when an agent edits them.
+ *
+ * CSV files round-trip with Google Sheets (push via sheetSync.pushTopic).
+ * JSON files go to the Drive backup folder via backupSetup({ files: [...] }).
+ * The UI uses `cloud_target` on each diff entry to label where it'll go.
+ */
+export type CloudTarget = "sheets" | "drive_backup";
+
+export const REVIEWABLE_FILES: { name: string; target: CloudTarget }[] = [
+  // CSVs — pushed to Google Sheets on confirm
+  { name: "employees.csv", target: "sheets" },
+  { name: "sales-pipeline.csv", target: "sheets" },
+  { name: "finance.csv", target: "sheets" },
+  { name: "tickets.csv", target: "sheets" },
+  { name: "content-calendar.csv", target: "sheets" },
+  // JSON — pushed to Drive backup folder on confirm
+  { name: "kpi.json", target: "drive_backup" },
+  { name: "tasks.json", target: "drive_backup" },
+  { name: "social-posts.json", target: "drive_backup" },
+  { name: "company-goals.json", target: "drive_backup" },
+];
+
+const REVIEWABLE_NAMES = REVIEWABLE_FILES.map((f) => f.name);
+const TARGET_BY_NAME = new Map(REVIEWABLE_FILES.map((f) => [f.name, f.target]));
 
 /** Setup files to back up (top-level files in data/). Skips .drive-state / .drive-config (chicken-egg). */
 const SETUP_FILES = [
@@ -425,6 +463,661 @@ async function saveBackupState(s: BackupState): Promise<void> {
   await fs.writeFile(BACKUP_STATE_PATH, JSON.stringify(s, null, 2), "utf8");
 }
 
+/* ---------- Local snapshot history (undo for backup/restore) ---------- */
+
+export interface SnapshotEntry {
+  timestamp: string;
+  reason: "before_backup" | "before_restore" | "before_ai" | "manual";
+  files: { name: string; size: number }[];
+  total_size: number;
+}
+
+interface SnapshotMeta {
+  reason: SnapshotEntry["reason"];
+  created_at: string;
+  files: { name: string; size: number }[];
+}
+
+function snapshotTimestamp(): string {
+  // 2026-05-27T10-30-15Z (filesystem-safe ISO)
+  return new Date().toISOString().replace(/[:.]/g, "-").replace(/-\d{3}Z$/, "Z");
+}
+
+async function rotateSnapshots(): Promise<void> {
+  try {
+    const items = await fs.readdir(HISTORY_DIR, { withFileTypes: true });
+    const dirs = items
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort(); // ISO timestamps sort lexicographically
+    const excess = dirs.length - HISTORY_KEEP;
+    if (excess <= 0) return;
+    for (let i = 0; i < excess; i++) {
+      await fs.rm(path.join(HISTORY_DIR, dirs[i]), {
+        recursive: true,
+        force: true,
+      });
+    }
+  } catch {
+    /* no history dir yet */
+  }
+}
+
+/**
+ * Snapshot every SETUP_FILES (+ chats) currently in data/ to a timestamped
+ * folder under .backup-history/. Used as an undo checkpoint before any
+ * destructive op (backup-upload, drive-restore). Missing files are skipped
+ * silently — the snapshot reflects whatever was actually present.
+ */
+export async function snapshotDataDir(
+  reason: SnapshotEntry["reason"],
+): Promise<SnapshotEntry | null> {
+  const ts = snapshotTimestamp();
+  const dest = path.join(HISTORY_DIR, ts);
+  const files: { name: string; size: number }[] = [];
+  let total = 0;
+
+  for (const filename of SETUP_FILES) {
+    const src = path.join(REPO_ROOT, "data", filename);
+    try {
+      const buf = await fs.readFile(src);
+      await fs.mkdir(dest, { recursive: true });
+      await fs.writeFile(path.join(dest, filename), buf);
+      files.push({ name: filename, size: buf.length });
+      total += buf.length;
+    } catch {
+      /* file doesn't exist in data/ — skip */
+    }
+  }
+
+  // Snapshot .chats/ too (flattened to chats__X.json mirroring backup format)
+  try {
+    const chatsDir = path.join(REPO_ROOT, "data", ".chats");
+    const chatItems = await fs.readdir(chatsDir);
+    for (const f of chatItems) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const buf = await fs.readFile(path.join(chatsDir, f));
+        await fs.mkdir(dest, { recursive: true });
+        await fs.writeFile(path.join(dest, `${CHATS_PREFIX}${f}`), buf);
+        files.push({ name: `${CHATS_PREFIX}${f}`, size: buf.length });
+        total += buf.length;
+      } catch {
+        /* skip unreadable chat */
+      }
+    }
+  } catch {
+    /* no chats dir */
+  }
+
+  if (files.length === 0) return null;
+
+  const meta: SnapshotMeta = {
+    reason,
+    created_at: new Date().toISOString(),
+    files,
+  };
+  await fs.writeFile(
+    path.join(dest, "_meta.json"),
+    JSON.stringify(meta, null, 2),
+    "utf8",
+  );
+
+  await rotateSnapshots();
+
+  return {
+    timestamp: ts,
+    reason,
+    files,
+    total_size: total,
+  };
+}
+
+export async function listSnapshots(): Promise<SnapshotEntry[]> {
+  let items: import("node:fs").Dirent[];
+  try {
+    items = await fs.readdir(HISTORY_DIR, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: SnapshotEntry[] = [];
+  for (const it of items) {
+    if (!it.isDirectory()) continue;
+    try {
+      const metaRaw = await fs.readFile(
+        path.join(HISTORY_DIR, it.name, "_meta.json"),
+        "utf8",
+      );
+      const meta = JSON.parse(metaRaw) as SnapshotMeta;
+      const total = meta.files.reduce((s, f) => s + f.size, 0);
+      out.push({
+        timestamp: it.name,
+        reason: meta.reason,
+        files: meta.files,
+        total_size: total,
+      });
+    } catch {
+      /* unreadable snapshot — ignore */
+    }
+  }
+  // Newest first
+  return out.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+}
+
+export interface RestoreSnapshotResult {
+  restored: number;
+  errors: { file: string; message: string }[];
+  files: string[];
+}
+
+/**
+ * Restore one local snapshot back into data/. Takes a snapshot of the
+ * *current* state first (reason: "before_restore") so the user can undo
+ * the undo if they restore the wrong snapshot.
+ */
+export async function restoreSnapshot(
+  timestamp: string,
+): Promise<RestoreSnapshotResult> {
+  const src = path.join(HISTORY_DIR, timestamp);
+  // Validate snapshot exists before snapshotting current state
+  try {
+    await fs.stat(path.join(src, "_meta.json"));
+  } catch {
+    throw new Error(`ไม่พบ snapshot: ${timestamp}`);
+  }
+
+  // Checkpoint the current state so this restore is also undoable
+  await snapshotDataDir("before_restore");
+
+  const result: RestoreSnapshotResult = { restored: 0, errors: [], files: [] };
+  let items: import("node:fs").Dirent[];
+  try {
+    items = await fs.readdir(src, { withFileTypes: true });
+  } catch (e) {
+    throw new Error(`อ่าน snapshot ไม่ได้: ${(e as Error).message}`);
+  }
+
+  for (const it of items) {
+    if (!it.isFile() || it.name === "_meta.json") continue;
+    try {
+      const buf = await fs.readFile(path.join(src, it.name));
+      let target: string;
+      if (it.name.startsWith(CHATS_PREFIX)) {
+        target = path.join(
+          REPO_ROOT,
+          "data",
+          ".chats",
+          it.name.slice(CHATS_PREFIX.length),
+        );
+        await fs.mkdir(path.dirname(target), { recursive: true });
+      } else {
+        target = path.join(REPO_ROOT, "data", it.name);
+      }
+      await fs.writeFile(target, buf);
+      result.restored++;
+      result.files.push(path.relative(REPO_ROOT, target).split(path.sep).join("/"));
+    } catch (e) {
+      result.errors.push({ file: it.name, message: (e as Error).message });
+    }
+  }
+  return result;
+}
+
+export async function deleteSnapshot(timestamp: string): Promise<void> {
+  const target = path.join(HISTORY_DIR, timestamp);
+  // Guard against escape attempts
+  if (!target.startsWith(HISTORY_DIR + path.sep)) {
+    throw new Error("invalid snapshot id");
+  }
+  await fs.rm(target, { recursive: true, force: true });
+}
+
+/* ---------- Pending-review state (AI edits → user accepts/reverts) ---------- */
+
+export interface ReviewState {
+  /** Snapshot timestamp captured before the AI started editing. null = no pending review. */
+  checkpoint_snapshot_ts: string | null;
+  /** When the checkpoint was created. */
+  created_at?: string;
+  /** What triggered the checkpoint — usually a chat id. */
+  trigger?: string;
+}
+
+async function loadReviewState(): Promise<ReviewState> {
+  try {
+    const raw = await fs.readFile(REVIEW_STATE_PATH, "utf8");
+    return JSON.parse(raw) as ReviewState;
+  } catch {
+    return { checkpoint_snapshot_ts: null };
+  }
+}
+
+async function saveReviewState(s: ReviewState): Promise<void> {
+  await fs.mkdir(path.dirname(REVIEW_STATE_PATH), { recursive: true });
+  await fs.writeFile(REVIEW_STATE_PATH, JSON.stringify(s, null, 2), "utf8");
+}
+
+/**
+ * Called before the AI starts processing a user message. If no review is
+ * already pending, take a fresh snapshot so any edits the AI makes can be
+ * reviewed/reverted. If a review IS already pending, don't bump the
+ * checkpoint — that would silently erase the "approved baseline" the user
+ * hasn't ACK'd yet.
+ */
+export async function ensureReviewCheckpoint(trigger: string): Promise<void> {
+  const state = await loadReviewState();
+  if (state.checkpoint_snapshot_ts) {
+    // Verify the snapshot still exists; if it was deleted out from under us
+    // (e.g. rotated out), drop the dangling pointer and take a new one.
+    const dir = path.join(HISTORY_DIR, state.checkpoint_snapshot_ts);
+    try {
+      await fs.stat(path.join(dir, "_meta.json"));
+      return;
+    } catch {
+      /* fall through and re-create */
+    }
+  }
+  const snap = await snapshotDataDir("before_ai");
+  if (!snap) return;
+  await saveReviewState({
+    checkpoint_snapshot_ts: snap.timestamp,
+    created_at: new Date().toISOString(),
+    trigger,
+  });
+}
+
+export interface ReviewDiffFile {
+  name: string;
+  status: "added" | "removed" | "modified" | "unchanged";
+  before_size: number;
+  after_size: number;
+  /** Row delta for CSVs; null for JSON or when not applicable. */
+  rows_before?: number;
+  rows_after?: number;
+  /** Where this file gets pushed when the user confirms. */
+  cloud_target: CloudTarget;
+  /**
+   * Direct link the user can click to inspect this file on Google Drive
+   * BEFORE confirming the upload. For CSVs this is the Google Sheets URL;
+   * for JSON it's the "⚙ Setup Backup" folder URL on Drive.
+   */
+  cloud_url?: string;
+  /** Human-readable label for the link target. */
+  cloud_url_label?: string;
+}
+
+/**
+ * Per-file status for things under outputs/ that have *not* been uploaded to
+ * Drive yet (or were modified since their last upload). Surfaced in the
+ * review modal so the user can confirm before each batch ships out.
+ */
+export interface OutputReviewFile {
+  /** Relative to outputs/, e.g. "content/launch.png" */
+  path: string;
+  name: string;
+  mime: string;
+  size: number;
+  mtime: number;
+  /** Top-level category folder, e.g. "content", "invoices". */
+  category: string;
+  /** "new" = never synced; "modified" = size changed since last sync. */
+  status: "new" | "modified";
+  /** If previously synced, URL on Drive (for the "↗ Drive" link). */
+  drive_url?: string;
+}
+
+export interface ReviewSummary {
+  pending: boolean;
+  checkpoint_snapshot_ts: string | null;
+  created_at?: string;
+  trigger?: string;
+  files: ReviewDiffFile[];
+  changed_count: number;
+  /** Files under outputs/ that need a confirm before being pushed to Drive. */
+  outputs: OutputReviewFile[];
+  /** Count of pending outputs (new + modified). */
+  outputs_pending_count: number;
+}
+
+/* Cached lookup helpers so we can include a "open in Drive" URL per file. */
+interface SheetsStateShape {
+  topics?: Record<string, { workbook_url?: string }>;
+}
+
+async function loadSheetsState(): Promise<SheetsStateShape> {
+  try {
+    const raw = await fs.readFile(
+      path.join(REPO_ROOT, "data", ".sheets-state.json"),
+      "utf8",
+    );
+    return JSON.parse(raw) as SheetsStateShape;
+  } catch {
+    return {};
+  }
+}
+
+async function loadDriveRootUrl(): Promise<string | undefined> {
+  const cfg = await loadConfig();
+  return cfg?.root_folder_url;
+}
+
+function csvFilenameToTopicId(filename: string): string {
+  // employees.csv → "employees", content-calendar.csv → "content-calendar"
+  return filename.replace(/\.csv$/i, "");
+}
+
+function buildCloudLink(
+  filename: string,
+  target: CloudTarget,
+  sheetsState: SheetsStateShape,
+  driveRootUrl: string | undefined,
+): { cloud_url?: string; cloud_url_label?: string } {
+  if (target === "sheets") {
+    const id = csvFilenameToTopicId(filename);
+    const url = sheetsState.topics?.[id]?.workbook_url;
+    if (url) {
+      return { cloud_url: url, cloud_url_label: "เปิดใน Google Sheets" };
+    }
+    return {};
+  }
+  // drive_backup: no per-file URL is cheap to compute, point at the backup
+  // folder under the connected Drive root.
+  if (driveRootUrl) {
+    return {
+      cloud_url: driveRootUrl,
+      cloud_url_label: "เปิด Drive (folder ⚙ Setup Backup)",
+    };
+  }
+  return {};
+}
+
+/**
+ * Walk outputs/ and decide which files still need to ship to Drive.
+ *
+ * A file is "new" if it's never been uploaded (no entry in drive-state),
+ * "modified" if its size differs from the last sync. We intentionally skip
+ * by-product paths (`uploads/` raw user uploads — those have their own flow)
+ * and dotfiles. We also skip files that match the drive-state size exactly
+ * so the modal only highlights *real* pending work.
+ */
+export async function getOutputsReview(): Promise<OutputReviewFile[]> {
+  const synced = await getSyncedMap();
+  const out: OutputReviewFile[] = [];
+
+  async function walk(dir: string): Promise<void> {
+    let items: import("node:fs").Dirent[];
+    try {
+      items = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const it of items) {
+      if (it.name.startsWith(".")) continue;
+      const full = path.join(dir, it.name);
+      if (it.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      if (!it.isFile()) continue;
+      const repoRel = path.relative(REPO_ROOT, full).split(path.sep).join("/");
+      const outputsRel = path.relative(OUTPUTS_DIR, full).split(path.sep).join("/");
+      const stat = await fs.stat(full);
+
+      // Match any existing sync entry — multiple destinations are tracked as
+      // `<repoRel>#<tag>` so we collapse on the prefix.
+      let matched: FileSyncEntry | null = null;
+      for (const key of Object.keys(synced)) {
+        if (key === repoRel || key.startsWith(`${repoRel}#`)) {
+          matched = synced[key];
+          break;
+        }
+      }
+      let status: "new" | "modified" | "synced";
+      if (!matched) status = "new";
+      else if (matched.size_at_sync !== stat.size) status = "modified";
+      else status = "synced";
+
+      if (status === "synced") continue; // only surface pending work
+
+      const segments = outputsRel.split("/");
+      const category = segments.length > 1 ? segments[0] : "misc";
+
+      out.push({
+        path: outputsRel,
+        name: it.name,
+        mime: mimeForExt(path.extname(it.name)),
+        size: stat.size,
+        mtime: stat.mtimeMs,
+        category,
+        status,
+        drive_url: matched?.url,
+      });
+    }
+  }
+  await walk(OUTPUTS_DIR);
+  // Newest first — the user usually wants to see what an agent just produced
+  out.sort((a, b) => b.mtime - a.mtime);
+  return out;
+}
+
+/**
+ * Compute a per-file diff between the pending checkpoint snapshot and the
+ * current state of data/. Used by the Data tab to surface AI edits.
+ */
+export async function getReviewSummary(): Promise<ReviewSummary> {
+  const state = await loadReviewState();
+  const outputs = await getOutputsReview();
+  const outputsPending = outputs.length;
+  const empty: ReviewSummary = {
+    pending: outputsPending > 0,
+    checkpoint_snapshot_ts: null,
+    files: [],
+    changed_count: 0,
+    outputs,
+    outputs_pending_count: outputsPending,
+  };
+  if (!state.checkpoint_snapshot_ts) return empty;
+
+  const snapDir = path.join(HISTORY_DIR, state.checkpoint_snapshot_ts);
+  try {
+    await fs.stat(snapDir);
+  } catch {
+    // Dangling pointer — clear it
+    await saveReviewState({ checkpoint_snapshot_ts: null });
+    return empty;
+  }
+
+  // Pre-fetch URL lookups once (state files are small) so each file gets
+  // enriched without N round-trips.
+  const [sheetsState, driveRootUrl] = await Promise.all([
+    loadSheetsState(),
+    loadDriveRootUrl(),
+  ]);
+
+  const files: ReviewDiffFile[] = [];
+  let changed = 0;
+  for (const filename of REVIEWABLE_NAMES) {
+    const target = TARGET_BY_NAME.get(filename)!;
+    const isCsv = filename.toLowerCase().endsWith(".csv");
+    const link = buildCloudLink(filename, target, sheetsState, driveRootUrl);
+    const snapPath = path.join(snapDir, filename);
+    const livePath = path.join(REPO_ROOT, "data", filename);
+    const [snapBuf, liveBuf] = await Promise.all([
+      fs.readFile(snapPath).catch(() => null),
+      fs.readFile(livePath).catch(() => null),
+    ]);
+
+    if (!snapBuf && !liveBuf) continue;
+    if (!snapBuf && liveBuf) {
+      files.push({
+        name: filename,
+        status: "added",
+        before_size: 0,
+        after_size: liveBuf.length,
+        rows_before: isCsv ? 0 : undefined,
+        rows_after: isCsv ? countCsvRows(liveBuf) : undefined,
+        cloud_target: target,
+        ...link,
+      });
+      changed++;
+      continue;
+    }
+    if (snapBuf && !liveBuf) {
+      files.push({
+        name: filename,
+        status: "removed",
+        before_size: snapBuf.length,
+        after_size: 0,
+        rows_before: isCsv ? countCsvRows(snapBuf) : undefined,
+        rows_after: isCsv ? 0 : undefined,
+        cloud_target: target,
+        ...link,
+      });
+      changed++;
+      continue;
+    }
+    if (snapBuf && liveBuf) {
+      const same =
+        snapBuf.length === liveBuf.length && snapBuf.equals(liveBuf);
+      files.push({
+        name: filename,
+        status: same ? "unchanged" : "modified",
+        before_size: snapBuf.length,
+        after_size: liveBuf.length,
+        rows_before: isCsv ? countCsvRows(snapBuf) : undefined,
+        rows_after: isCsv ? countCsvRows(liveBuf) : undefined,
+        cloud_target: target,
+        ...link,
+      });
+      if (!same) changed++;
+    }
+  }
+
+  return {
+    pending: changed > 0 || outputsPending > 0,
+    checkpoint_snapshot_ts: state.checkpoint_snapshot_ts,
+    created_at: state.created_at,
+    trigger: state.trigger,
+    files,
+    changed_count: changed,
+    outputs,
+    outputs_pending_count: outputsPending,
+  };
+}
+
+function countCsvRows(buf: Buffer): number {
+  // Rows = non-empty lines minus header
+  const lines = buf
+    .toString("utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0).length;
+  return Math.max(0, lines - 1);
+}
+
+export async function acceptReview(): Promise<void> {
+  await saveReviewState({ checkpoint_snapshot_ts: null });
+}
+
+/** Max characters we'll send back to the UI for preview. Guards against
+ *  blowing up the browser on accidentally huge JSON dumps. */
+const PREVIEW_MAX_CHARS = 32 * 1024;
+
+export interface ReviewPreview {
+  name: string;
+  status: "added" | "removed" | "modified" | "unchanged" | "missing";
+  before: string | null;
+  after: string | null;
+  /** True if either side was clipped to PREVIEW_MAX_CHARS. */
+  truncated: boolean;
+  cloud_target?: CloudTarget;
+  cloud_url?: string;
+  cloud_url_label?: string;
+}
+
+/**
+ * Return the before/after content (utf-8) for one file in the pending review.
+ * Used by the UI to render a side-by-side diff.
+ */
+export async function getReviewPreview(
+  filename: string,
+): Promise<ReviewPreview> {
+  if (!REVIEWABLE_NAMES.includes(filename)) {
+    return {
+      name: filename,
+      status: "missing",
+      before: null,
+      after: null,
+      truncated: false,
+    };
+  }
+  const state = await loadReviewState();
+  if (!state.checkpoint_snapshot_ts) {
+    return {
+      name: filename,
+      status: "missing",
+      before: null,
+      after: null,
+      truncated: false,
+      cloud_target: TARGET_BY_NAME.get(filename),
+    };
+  }
+  const snapPath = path.join(
+    HISTORY_DIR,
+    state.checkpoint_snapshot_ts,
+    filename,
+  );
+  const livePath = path.join(REPO_ROOT, "data", filename);
+  const [snapBuf, liveBuf] = await Promise.all([
+    fs.readFile(snapPath, "utf8").catch(() => null),
+    fs.readFile(livePath, "utf8").catch(() => null),
+  ]);
+  let truncated = false;
+  const clip = (s: string | null): string | null => {
+    if (s === null) return null;
+    if (s.length > PREVIEW_MAX_CHARS) {
+      truncated = true;
+      return s.slice(0, PREVIEW_MAX_CHARS);
+    }
+    return s;
+  };
+  const before = clip(snapBuf);
+  const after = clip(liveBuf);
+  let status: ReviewPreview["status"];
+  if (!snapBuf && !liveBuf) status = "missing";
+  else if (!snapBuf && liveBuf) status = "added";
+  else if (snapBuf && !liveBuf) status = "removed";
+  else status = snapBuf === liveBuf ? "unchanged" : "modified";
+
+  const target = TARGET_BY_NAME.get(filename);
+  const [sheetsState, driveRootUrl] = await Promise.all([
+    loadSheetsState(),
+    loadDriveRootUrl(),
+  ]);
+  const link = target
+    ? buildCloudLink(filename, target, sheetsState, driveRootUrl)
+    : {};
+  return {
+    name: filename,
+    status,
+    before,
+    after,
+    truncated,
+    cloud_target: target,
+    ...link,
+  };
+}
+
+export async function revertReview(): Promise<RestoreSnapshotResult> {
+  const state = await loadReviewState();
+  if (!state.checkpoint_snapshot_ts) {
+    throw new Error("ไม่มีการเปลี่ยนแปลงรอ review");
+  }
+  const result = await restoreSnapshot(state.checkpoint_snapshot_ts);
+  // After restoring, the files match the snapshot → no longer pending
+  await saveReviewState({ checkpoint_snapshot_ts: null });
+  return result;
+}
+
 interface DriveFileInfo {
   id: string;
   name: string;
@@ -453,6 +1146,16 @@ export interface BackupResult {
   uploaded: number;
   skipped: number;
   errors: { file: string; message: string }[];
+  /** Files refused by safety guards. Caller can retry with force:true to override. */
+  protected: ProtectedFile[];
+}
+
+export interface ProtectedFile {
+  file: string;
+  reason: "empty" | "header_only" | "shrink";
+  local_size: number;
+  drive_size?: number;
+  detail: string;
 }
 
 export interface RestoreResult {
@@ -495,15 +1198,59 @@ export async function getBackupStatus(): Promise<BackupStatus> {
   }
 }
 
-export async function backupSetup(): Promise<BackupResult> {
+export async function backupSetup(
+  opts?: { force?: boolean; files?: string[] },
+): Promise<BackupResult> {
+  const force = !!opts?.force;
+  const filter = opts?.files;
   const cfg = await loadConfig();
   if (!cfg) throw new Error("Drive ยังไม่ได้เชื่อม");
-  const result: BackupResult = { uploaded: 0, skipped: 0, errors: [] };
+  const result: BackupResult = {
+    uploaded: 0,
+    skipped: 0,
+    errors: [],
+    protected: [],
+  };
 
-  for (const filename of SETUP_FILES) {
+  // Take a local checkpoint BEFORE anything goes to Drive. If the upload
+  // wipes the Drive copy and the user wants to roll back, this snapshot
+  // is what they restore from.
+  await snapshotDataDir("before_backup");
+
+  // Look up sizes of existing backup files on Drive so we can detect shrinks.
+  // If listing fails (old Apps Script, network), skip the shrink guard rather
+  // than blocking the whole backup.
+  const driveSizes: Record<string, number> = {};
+  if (!force) {
+    try {
+      const list = await callScript<ListBackupResponse>(cfg.url, {
+        action: "list_backup",
+      });
+      if (list.ok && list.files) {
+        for (const f of list.files) driveSizes[f.name] = f.size;
+      }
+    } catch {
+      /* shrink guard becomes a no-op for this run */
+    }
+  }
+
+  const targetFiles = filter
+    ? SETUP_FILES.filter((f) => filter.includes(f))
+    : SETUP_FILES;
+
+  for (const filename of targetFiles) {
     const full = path.join(REPO_ROOT, "data", filename);
     try {
       const buf = await fs.readFile(full);
+
+      if (!force) {
+        const guard = checkBackupGuard(filename, buf, driveSizes[filename]);
+        if (guard) {
+          result.protected.push(guard);
+          continue;
+        }
+      }
+
       await uploadOne(cfg.url, filename, buf, mimeForExt(path.extname(filename)));
       result.uploaded++;
     } catch (e) {
@@ -542,8 +1289,62 @@ export async function backupSetup(): Promise<BackupResult> {
     /* no .chats yet */
   }
 
-  await saveBackupState({ last_backup_at: new Date().toISOString() });
+  // Only record a fresh backup timestamp if we actually uploaded something.
+  // Otherwise the UI would falsely claim "backed up just now" while all files
+  // were refused by guards.
+  if (result.uploaded > 0) {
+    await saveBackupState({ last_backup_at: new Date().toISOString() });
+  }
   return result;
+}
+
+/**
+ * Three safety checks before overwriting a backup on Drive:
+ *  - empty:        local file is 0 bytes (likely truncated)
+ *  - header_only:  CSV that has no data rows (likely reset by setup wizard)
+ *  - shrink:       new payload is < 50% of what's on Drive (likely partial)
+ * Caller can pass force:true to bypass all three.
+ */
+function checkBackupGuard(
+  filename: string,
+  buf: Buffer,
+  driveSize?: number,
+): ProtectedFile | null {
+  const size = buf.length;
+  if (size === 0) {
+    return {
+      file: filename,
+      reason: "empty",
+      local_size: 0,
+      drive_size: driveSize,
+      detail: "ไฟล์ local ว่าง 0 bytes — ไม่ทับของบน Drive",
+    };
+  }
+  if (filename.toLowerCase().endsWith(".csv")) {
+    const dataRows = buf
+      .toString("utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0).length - 1;
+    if (dataRows <= 0) {
+      return {
+        file: filename,
+        reason: "header_only",
+        local_size: size,
+        drive_size: driveSize,
+        detail: "CSV เหลือแค่ header — ไม่มี data row ป้องกันการล้างข้อมูลโดยไม่ตั้งใจ",
+      };
+    }
+  }
+  if (driveSize !== undefined && driveSize > 0 && size < driveSize * 0.5) {
+    return {
+      file: filename,
+      reason: "shrink",
+      local_size: size,
+      drive_size: driveSize,
+      detail: `ของใหม่ ${size} bytes / ของเดิมบน Drive ${driveSize} bytes — เล็กกว่าครึ่ง อาจหลุดข้อมูล`,
+    };
+  }
+  return null;
 }
 
 async function uploadOne(
@@ -565,6 +1366,10 @@ async function uploadOne(
 export async function restoreFromDrive(): Promise<RestoreResult> {
   const cfg = await loadConfig();
   if (!cfg) throw new Error("Drive ยังไม่ได้เชื่อม");
+
+  // Restore is destructive (overwrites local data/). Snapshot the current
+  // state first so the user can roll back if they restored the wrong copy.
+  await snapshotDataDir("before_restore");
 
   const list = await callScript<ListBackupResponse>(cfg.url, {
     action: "list_backup",

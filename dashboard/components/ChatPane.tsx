@@ -160,13 +160,14 @@ export default function ChatPane({ employee }: Props) {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, streaming, outputs]);
 
-  async function uploadFiles(fileList: FileList | null) {
-    if (!fileList?.length) return;
+  async function uploadFiles(fileList: FileList | File[] | null) {
+    if (!fileList || (fileList as { length?: number }).length === 0) return;
     setUploading(true);
     setError(null);
     try {
       const uploaded: Attachment[] = [];
-      for (const file of Array.from(fileList)) {
+      const files = Array.from(fileList as ArrayLike<File>);
+      for (const file of files) {
         const fd = new FormData();
         fd.append("file", file);
         const res = await fetch("/api/upload", { method: "POST", body: fd });
@@ -181,6 +182,27 @@ export default function ChatPane({ employee }: Props) {
       setUploading(false);
       if (fileRef.current) fileRef.current.value = "";
     }
+  }
+
+  /**
+   * Paste-to-attach: when the user pastes a screenshot or copied image into the
+   * chat textarea, grab the File objects from clipboardData and upload them as
+   * attachments (same flow as the paperclip button). Plain text paste still
+   * falls through to the textarea's default behavior.
+   */
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData?.items;
+    if (!items?.length) return;
+    const files: File[] = [];
+    for (const item of Array.from(items)) {
+      if (item.kind === "file") {
+        const f = item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length === 0) return;
+    e.preventDefault();
+    void uploadFiles(files);
   }
 
   function removePending(path: string) {
@@ -557,7 +579,8 @@ export default function ChatPane({ employee }: Props) {
               value={input}
               onChange={setInput}
               onSubmit={send}
-              placeholder={`พิมพ์ถาม ${employee.name}… (Enter ส่ง, @ เพื่อเรียกคน)`}
+              onPaste={handlePaste}
+              placeholder={`พิมพ์ถาม ${employee.name}… (Enter ส่ง, @ เพื่อเรียกคน, แปะรูปได้)`}
               rows={2}
               className="input min-h-[52px] flex-1 w-full"
               disabled={streaming}

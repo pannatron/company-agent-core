@@ -55,6 +55,21 @@ interface BackupStatus {
   reason?: string;
 }
 
+interface ProtectedFile {
+  file: string;
+  reason: "empty" | "header_only" | "shrink";
+  local_size: number;
+  drive_size?: number;
+  detail: string;
+}
+
+interface Snapshot {
+  timestamp: string;
+  reason: "before_backup" | "before_restore" | "before_ai" | "manual";
+  files: { name: string; size: number }[];
+  total_size: number;
+}
+
 export default function FilesView() {
   const [files, setFiles] = useState<OutputFile[]>([]);
   const [cats, setCats] = useState<CategoryMeta[]>([]);
@@ -71,6 +86,23 @@ export default function FilesView() {
   const [restoring, setRestoring] = useState(false);
   const [confirmingRestore, setConfirmingRestore] = useState(false);
   const [backupToast, setBackupToast] = useState<string | null>(null);
+  const [protectedFiles, setProtectedFiles] = useState<ProtectedFile[]>([]);
+  const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [confirmingRestoreTs, setConfirmingRestoreTs] = useState<string | null>(
+    null,
+  );
+  const [snapshotBusy, setSnapshotBusy] = useState(false);
+
+  const loadSnapshots = useCallback(async () => {
+    try {
+      const res = await fetch("/api/setup/backup/history");
+      const data = (await res.json()) as { snapshots?: Snapshot[] };
+      setSnapshots(data.snapshots || []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -88,23 +120,106 @@ export default function FilesView() {
       setCats(fd.categories || []);
       setDrive((await driveRes.json()) as DriveStatus);
       setBackupStatus((await backupRes.json()) as BackupStatus);
+      await loadSnapshots();
     } finally {
       setLoading(false);
     }
-  }, [includeUploads]);
+  }, [includeUploads, loadSnapshots]);
 
-  async function backupNow() {
-    setBacking(true);
+  async function snapshotNow() {
+    setSnapshotBusy(true);
     setBackupToast(null);
     try {
-      const res = await fetch("/api/setup/backup", { method: "POST" });
+      const res = await fetch("/api/setup/backup/history", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "snapshot" }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setBackupToast(data.error || "snapshot ล้มเหลว");
+      } else {
+        setBackupToast(`✓ บันทึก snapshot สำเร็จ — ${data.snapshot.files.length} ไฟล์`);
+      }
+      await loadSnapshots();
+    } catch (e) {
+      setBackupToast((e as Error).message);
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
+  async function restoreSnapshot(timestamp: string) {
+    if (confirmingRestoreTs !== timestamp) {
+      setConfirmingRestoreTs(timestamp);
+      setTimeout(() => {
+        setConfirmingRestoreTs((cur) => (cur === timestamp ? null : cur));
+      }, 4000);
+      return;
+    }
+    setConfirmingRestoreTs(null);
+    setSnapshotBusy(true);
+    setBackupToast(null);
+    try {
+      const res = await fetch("/api/setup/backup/history", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "restore", timestamp }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setBackupToast(data.error || "ย้อนกลับล้มเหลว");
+      } else {
+        setBackupToast(
+          `✓ ย้อนกลับสำเร็จ — เขียนทับ ${data.restored} ไฟล์ (เก็บของเดิมก่อน restore ไว้แล้ว)`,
+        );
+      }
+      await load();
+    } catch (e) {
+      setBackupToast((e as Error).message);
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
+  async function deleteSnapshot(timestamp: string) {
+    setSnapshotBusy(true);
+    try {
+      await fetch("/api/setup/backup/history", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "delete", timestamp }),
+      });
+      await loadSnapshots();
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
+  async function backupNow(force = false) {
+    setBacking(true);
+    setBackupToast(null);
+    if (!force) setProtectedFiles([]);
+    try {
+      const res = await fetch(
+        `/api/setup/backup${force ? "?force=1" : ""}`,
+        { method: "POST" },
+      );
       const data = await res.json();
       if (!res.ok || !data.ok) {
         setBackupToast(data.error || `backup ล้มเหลว`);
       } else {
+        const protectedCount = Array.isArray(data.protected)
+          ? data.protected.length
+          : 0;
+        setProtectedFiles(
+          protectedCount > 0 ? (data.protected as ProtectedFile[]) : [],
+        );
+        const prefix = data.uploaded > 0 ? "✓" : protectedCount > 0 ? "⚠" : "·";
         setBackupToast(
-          `✓ Backup สำเร็จ — อัป ${data.uploaded} ไฟล์` +
+          `${prefix} Backup ${force ? "(บังคับทับ) " : ""}— อัป ${data.uploaded} ไฟล์` +
             (data.skipped ? `, ข้าม ${data.skipped}` : "") +
+            (protectedCount > 0 ? `, ป้องกัน ${protectedCount}` : "") +
             (data.errors?.length ? `, error ${data.errors.length}` : ""),
         );
       }
@@ -262,9 +377,20 @@ export default function FilesView() {
         backing={backing}
         restoring={restoring}
         confirmingRestore={confirmingRestore}
+        protectedFiles={protectedFiles}
+        snapshots={snapshots}
+        showHistory={showHistory}
+        snapshotBusy={snapshotBusy}
+        confirmingRestoreTs={confirmingRestoreTs}
         onSync={syncNow}
-        onBackup={backupNow}
+        onBackup={() => backupNow(false)}
+        onForceBackup={() => backupNow(true)}
+        onDismissProtected={() => setProtectedFiles([])}
         onRestore={restoreNow}
+        onToggleHistory={() => setShowHistory((v) => !v)}
+        onSnapshotNow={snapshotNow}
+        onRestoreSnapshot={restoreSnapshot}
+        onDeleteSnapshot={deleteSnapshot}
         onConnect={() => setShowSetup(true)}
         onDisconnect={async () => {
           await fetch("/api/drive/config", { method: "DELETE" });
@@ -314,9 +440,20 @@ function DrivePanel({
   backing,
   restoring,
   confirmingRestore,
+  protectedFiles,
+  snapshots,
+  showHistory,
+  snapshotBusy,
+  confirmingRestoreTs,
   onSync,
   onBackup,
+  onForceBackup,
+  onDismissProtected,
   onRestore,
+  onToggleHistory,
+  onSnapshotNow,
+  onRestoreSnapshot,
+  onDeleteSnapshot,
   onConnect,
   onDisconnect,
 }: {
@@ -328,9 +465,20 @@ function DrivePanel({
   backing: boolean;
   restoring: boolean;
   confirmingRestore: boolean;
+  protectedFiles: ProtectedFile[];
+  snapshots: Snapshot[];
+  showHistory: boolean;
+  snapshotBusy: boolean;
+  confirmingRestoreTs: string | null;
   onSync: () => void;
   onBackup: () => void;
+  onForceBackup: () => void;
+  onDismissProtected: () => void;
   onRestore: () => void;
+  onToggleHistory: () => void;
+  onSnapshotNow: () => void;
+  onRestoreSnapshot: (ts: string) => void;
+  onDeleteSnapshot: (ts: string) => void;
   onConnect: () => void;
   onDisconnect: () => void;
 }) {
@@ -535,6 +683,18 @@ function DrivePanel({
                 ? "ยืนยัน restore? (เขียนทับ)"
                 : "♻ Restore"}
           </button>
+          <button
+            onClick={onToggleHistory}
+            className={[
+              "rounded-md border px-2 py-1 text-[11px] disabled:opacity-40",
+              showHistory
+                ? "border-accent bg-accent/10 text-ink"
+                : "border-border bg-surface text-ink hover:border-accent",
+            ].join(" ")}
+            title="ดู snapshots ของ data/ ที่บันทึกอัตโนมัติก่อน backup/restore — กดย้อนกลับได้"
+          >
+            📜 ประวัติ {snapshots.length > 0 && `(${snapshots.length})`}
+          </button>
           {backup?.folder_url && (
             <a
               href={backup.folder_url}
@@ -552,7 +712,11 @@ function DrivePanel({
             <span
               className={[
                 "text-[10.5px]",
-                backupToast.startsWith("✓") ? "text-ok" : "text-danger",
+                backupToast.startsWith("✓")
+                  ? "text-ok"
+                  : backupToast.startsWith("⚠")
+                    ? "text-warn"
+                    : "text-danger",
               ].join(" ")}
             >
               {backupToast}
@@ -560,8 +724,204 @@ function DrivePanel({
           )}
         </div>
       )}
+
+      {ok && protectedFiles.length > 0 && (
+        <ProtectedFilesPanel
+          files={protectedFiles}
+          busy={backing || restoring}
+          onForce={onForceBackup}
+          onDismiss={onDismissProtected}
+        />
+      )}
+
+      {ok && showHistory && (
+        <HistoryPanel
+          snapshots={snapshots}
+          busy={snapshotBusy || backing || restoring}
+          confirmingRestoreTs={confirmingRestoreTs}
+          onSnapshotNow={onSnapshotNow}
+          onRestoreSnapshot={onRestoreSnapshot}
+          onDeleteSnapshot={onDeleteSnapshot}
+        />
+      )}
     </div>
   );
+}
+
+/* ---------- Snapshot history panel ---------- */
+
+function HistoryPanel({
+  snapshots,
+  busy,
+  confirmingRestoreTs,
+  onSnapshotNow,
+  onRestoreSnapshot,
+  onDeleteSnapshot,
+}: {
+  snapshots: Snapshot[];
+  busy: boolean;
+  confirmingRestoreTs: string | null;
+  onSnapshotNow: () => void;
+  onRestoreSnapshot: (ts: string) => void;
+  onDeleteSnapshot: (ts: string) => void;
+}) {
+  return (
+    <div className="mt-2 rounded-md border border-border bg-surface/40 p-2.5">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium text-ink-dim">
+          📜 Local snapshots — ย้อนกลับ data/ ของเครื่องนี้
+        </span>
+        <button
+          onClick={onSnapshotNow}
+          disabled={busy}
+          className="rounded-md border border-border bg-surface px-2 py-0.5 text-[10.5px] text-ink hover:border-accent disabled:opacity-40"
+        >
+          {busy ? "กำลังบันทึก…" : "📸 บันทึกตอนนี้"}
+        </button>
+      </div>
+      {snapshots.length === 0 ? (
+        <div className="text-[10.5px] text-ink-dim/70">
+          ยังไม่มี snapshot — ระบบจะบันทึกอัตโนมัติก่อน Backup / Restore ครั้งถัดไป
+          (เก็บ 10 รอบล่าสุด)
+        </div>
+      ) : (
+        <ul className="space-y-1">
+          {snapshots.map((s) => (
+            <li
+              key={s.timestamp}
+              className="flex items-center justify-between gap-2 rounded-md border border-border/60 bg-bg px-2 py-1.5"
+            >
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5 text-[11px] text-ink">
+                  <span className="font-mono text-[10.5px]">
+                    {fmtSnapshotTs(s.timestamp)}
+                  </span>
+                  <span
+                    className={[
+                      "rounded px-1 py-px text-[9.5px]",
+                      reasonStyle(s.reason),
+                    ].join(" ")}
+                  >
+                    {reasonLabel(s.reason)}
+                  </span>
+                </div>
+                <div className="text-[10px] text-ink-dim/80">
+                  {s.files.length} ไฟล์ · {fmtBytes(s.total_size)}
+                </div>
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => onRestoreSnapshot(s.timestamp)}
+                  disabled={busy}
+                  className={[
+                    "rounded-md border px-2 py-0.5 text-[10.5px] disabled:opacity-40",
+                    confirmingRestoreTs === s.timestamp
+                      ? "border-warn bg-warn/10 text-warn"
+                      : "border-border bg-surface text-ink hover:border-accent",
+                  ].join(" ")}
+                >
+                  {confirmingRestoreTs === s.timestamp
+                    ? "ยืนยัน? (เขียนทับ)"
+                    : "↩ ย้อนกลับ"}
+                </button>
+                <button
+                  onClick={() => onDeleteSnapshot(s.timestamp)}
+                  disabled={busy}
+                  className="rounded-md border border-border bg-surface px-1.5 py-0.5 text-[10.5px] text-ink-dim hover:border-danger hover:text-danger disabled:opacity-40"
+                  title="ลบ snapshot นี้"
+                >
+                  ✕
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function fmtSnapshotTs(ts: string): string {
+  // Convert 2026-05-27T10-30-15Z → 2026-05-27 10:30:15
+  const m = ts.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/);
+  if (!m) return ts;
+  return `${m[1]} ${m[2]}:${m[3]}:${m[4]}`;
+}
+
+function reasonLabel(r: Snapshot["reason"]): string {
+  if (r === "before_backup") return "ก่อน backup";
+  if (r === "before_restore") return "ก่อน restore";
+  if (r === "before_ai") return "ก่อน AI แก้";
+  return "manual";
+}
+
+function reasonStyle(r: Snapshot["reason"]): string {
+  if (r === "before_backup") return "bg-accent/10 text-accent";
+  if (r === "before_restore") return "bg-warn/10 text-warn";
+  if (r === "before_ai") return "bg-fuchsia-500/10 text-fuchsia-400";
+  return "bg-ink-dim/10 text-ink-dim";
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/* ---------- Protected files warning ---------- */
+
+function ProtectedFilesPanel({
+  files,
+  busy,
+  onForce,
+  onDismiss,
+}: {
+  files: ProtectedFile[];
+  busy: boolean;
+  onForce: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="mt-2 rounded-md border border-warn/40 bg-warn/5 p-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium text-warn">
+          ⚠ Backup ป้องกัน {files.length} ไฟล์ — ของใหม่อาจมีปัญหา
+        </span>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={onForce}
+            disabled={busy}
+            className="rounded-md border border-warn/60 bg-warn/10 px-2 py-0.5 text-[10.5px] font-medium text-warn hover:bg-warn/20 disabled:opacity-40"
+            title="ทับของบน Drive ด้วย local ปัจจุบันโดยข้าม guard ทั้งหมด"
+          >
+            {busy ? "กำลังบังคับ…" : "บังคับ backup ทับ"}
+          </button>
+          <button
+            onClick={onDismiss}
+            disabled={busy}
+            className="rounded-md border border-border bg-surface px-2 py-0.5 text-[10.5px] text-ink-dim hover:border-accent disabled:opacity-40"
+          >
+            ปิด
+          </button>
+        </div>
+      </div>
+      <ul className="mt-1.5 space-y-0.5 text-[10.5px] text-ink-dim">
+        {files.map((f) => (
+          <li key={f.file}>
+            <code className="text-ink">{f.file}</code> —{" "}
+            <span className="text-warn">{labelReason(f.reason)}</span>
+            <span className="text-ink-dim/80"> · {f.detail}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function labelReason(r: ProtectedFile["reason"]): string {
+  if (r === "empty") return "ไฟล์ว่าง";
+  if (r === "header_only") return "CSV เหลือแค่ header";
+  return "เล็กกว่าของเดิมเกิน 50%";
 }
 
 /* ---------- Category section ---------- */

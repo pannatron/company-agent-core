@@ -31,3 +31,5 @@ yarn-debug.log*
 /outputs/*
 !/outputs/.gitkeep
 !/outputs/sop-*.md
+
+graphify-out/

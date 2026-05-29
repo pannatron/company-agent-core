@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  ClipboardEvent,
   forwardRef,
   KeyboardEvent,
   useCallback,
@@ -18,6 +19,12 @@ interface Props {
   onChange: (v: string) => void;
   /** Called when user hits Enter (without Shift) AND the suggestion popup is closed. */
   onSubmit?: () => void;
+  /**
+   * Forwarded to the underlying textarea. Lets callers grab images from the
+   * clipboard (Cmd/Ctrl+V of a screenshot or copied image) before the default
+   * paste-as-text behavior fires.
+   */
+  onPaste?: (e: ClipboardEvent<HTMLTextAreaElement>) => void;
   placeholder?: string;
   rows?: number;
   className?: string;
@@ -31,7 +38,16 @@ interface Props {
  * - ถ้า popup ปิดอยู่ Enter (ไม่กด shift) จะเรียก onSubmit ปกติ
  */
 const MentionTextarea = forwardRef<HTMLTextAreaElement, Props>(function MentionTextarea(
-  { value, onChange, onSubmit, placeholder, rows = 2, className, disabled },
+  {
+    value,
+    onChange,
+    onSubmit,
+    onPaste,
+    placeholder,
+    rows = 2,
+    className,
+    disabled,
+  },
   ref,
 ) {
   const innerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -159,6 +175,7 @@ const MentionTextarea = forwardRef<HTMLTextAreaElement, Props>(function MentionT
         onKeyDown={handleKeyDown}
         onKeyUp={handleSelectionChange}
         onClick={handleSelectionChange}
+        onPaste={onPaste}
         placeholder={placeholder}
         rows={rows}
         className={className}

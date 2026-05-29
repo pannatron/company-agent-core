@@ -103,11 +103,24 @@ BOROT Company/
 └── 📝 Marketing/Content Calendar     tab "calendar"  ↔ data/content-calendar.csv
 ```
 
-**กติกาเวลาทำงานกับ CSV เหล่านี้:**
-1. **ก่อนอ่าน/อิงตัวเลข** — รัน `node scripts/sheets-sync.mjs pull <topic>` (หรือ `pull` เปล่าๆ ทุกหัวข้อ) เพื่อ refresh cache จาก Sheets
-2. **หลังแก้** — รัน `node scripts/sheets-sync.mjs push <topic>` เพื่อ sync กลับขึ้น Sheets
-3. **อย่าแก้ CSV โดยไม่ push** — ของบน Sheets จะกลายเป็น stale แล้วครั้งถัดไป pull จะทับงานคุณ
-4. ไฟล์ JSON (`kpi.json`, `company-goals.json`, `company-profile.json`, `tasks.json`, `social-posts.json`) ยังเก็บใน `data/` ปกติ — backup ขึ้น Drive ผ่าน `/api/setup/backup` ไม่ใช่ Sheets
+**กติกาเวลาทำงานกับ CSV เหล่านี้ (บังคับ — semi-auto flow):**
+
+ทุกครั้งที่ user สั่งงานที่จะ "อ่านตัวเลข" หรือ "แก้ข้อมูล" ใน CSV ใดใน 5 ไฟล์นี้ (`sales-pipeline.csv`, `employees.csv`, `finance.csv`, `tickets.csv`, `content-calendar.csv`) — agent **ต้องเดิน 3 step นี้เองโดยไม่ต้องรอ user สั่งย่อย** และ **แจ้ง user สั้น ๆ ก่อนแต่ละ step** (ไม่ใช่ silent):
+
+```
+[1] "กำลัง pull <topic>…"   → Bash: node scripts/sheets-sync.mjs pull <topic>
+[2] "แก้ data/<file>…"      → Edit (เห็น diff, user กดอนุญาตปกติ)
+[3] "push กลับขึ้น Sheet…"  → Bash: node scripts/sheets-sync.mjs push <topic>
+```
+
+- **ห้ามข้าม step 1** แม้คิดว่า cache สด — ของบน Sheet อาจถูกแก้จากมือถือ/คนอื่นระหว่างนั้น
+- **ห้ามข้าม step 3** เด็ดขาด — แก้แล้วไม่ push = Sheet stale + pull ครั้งหน้าทับงานหายเงียบ
+- **ห้ามรวบ 3 step เป็น `&&` chain** เพื่อข้าม approval — user อยากกดอนุญาตทีละ step
+- ถ้าเป็นแค่ "ดูข้อมูล" ไม่แก้ → ทำแค่ step 1 พอ
+- ถ้า `pull` fail (Apps Script down/v ไม่ตรง) → **หยุด** บอก user ห้ามแก้ local ต่อ
+- ถ้า user สั่งงานที่ยังขาดข้อมูล (เช่น "เพิ่มพนักงาน" แต่ไม่บอกบัญชี/เงินเดือน) → ถามให้ครบก่อน step 2
+
+ไฟล์ JSON (`kpi.json`, `company-goals.json`, `company-profile.json`, `tasks.json`, `social-posts.json`) ไม่ใช้ flow นี้ — ยังเก็บใน `data/` ปกติ backup ขึ้น Drive ผ่าน `/api/setup/backup`
 
 **ค่า topic ที่ใช้:** `sales-pipeline`, `employees`, `finance`, `tickets`, `content-calendar`
 
