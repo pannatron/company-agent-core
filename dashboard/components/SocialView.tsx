@@ -43,6 +43,7 @@ interface Post {
   published_at?: string;
   external_url?: string;
   campaign?: string;
+  notes?: string;
   engagement?: Engagement | null;
   last_attempt_at?: string;
   attempt_count?: number;
@@ -64,8 +65,12 @@ interface CardActions {
   onPostNow: (postId: string) => Promise<void>;
   onRetry: (postId: string) => Promise<void>;
   onDelete: (post: Post) => Promise<void>;
+  onOpen: (post: Post) => void;
   busyPostId: string | null;
 }
+
+/** Statuses that can still be (re)scheduled from the dashboard. */
+const SCHEDULABLE: PostStatus[] = ["draft", "ready_for_review", "approved", "scheduled", "failed"];
 
 const COLUMNS: { key: PostStatus | "in_progress"; label: string; statuses: PostStatus[] }[] = [
   { key: "in_progress", label: "ร่าง / กำลังทำ", statuses: ["draft", "ready_for_review", "approved"] },
@@ -79,6 +84,7 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
   const [localBump, setLocalBump] = useState(0);
   const [busyPostId, setBusyPostId] = useState<string | null>(null);
   const [actionToast, setActionToast] = useState<string | null>(null);
+  const [previewId, setPreviewId] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -219,6 +225,42 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
     }
   };
 
+  /**
+   * Schedule (or reschedule) a post: PATCH the local JSON to
+   * status=scheduled + scheduled_at, which also pushes the queue to Sheets so
+   * the Apps Script trigger publishes it when due. Returns true on full
+   * success (incl. Sheet push) so the modal knows whether to close.
+   */
+  const onSchedule = async (postId: string, scheduledAtIso: string): Promise<boolean> => {
+    setBusyPostId(postId);
+    setActionToast(null);
+    try {
+      const r = await fetch("/api/social", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ post_id: postId, scheduled_at: scheduledAtIso }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.ok === false) {
+        // 502 = scheduled locally then reverted because the Sheet push failed
+        // (e.g. asset not on Drive yet). Reload so the card reflects the revert.
+        if (d.reverted) reload();
+        setActionToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+        return false;
+      }
+      setActionToast(`✓ ตั้งเวลาโพสต์ ${fmtDate(d.scheduled_at)} แล้ว · sync Sheets`);
+      reload();
+      return true;
+    } finally {
+      setBusyPostId(null);
+    }
+  };
+
+  const previewPost = useMemo(
+    () => data?.posts.find((p) => p.id === previewId) ?? null,
+    [data, previewId],
+  );
+
   const grouped = useMemo(() => {
     const out = new Map<string, Post[]>();
     if (!data) return out;
@@ -285,12 +327,22 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
                 key={col.key}
                 label={col.label}
                 posts={grouped.get(col.key) ?? []}
-                actions={{ onPostNow, onRetry, onDelete, busyPostId }}
+                actions={{ onPostNow, onRetry, onDelete, onOpen: (p) => setPreviewId(p.id), busyPostId }}
               />
             ))}
           </div>
         )}
       </div>
+
+      {previewPost && (
+        <PostPreviewModal
+          key={previewPost.id}
+          post={previewPost}
+          busy={busyPostId === previewPost.id}
+          onClose={() => setPreviewId(null)}
+          onSchedule={onSchedule}
+        />
+      )}
     </div>
   );
 }
@@ -362,8 +414,22 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
   const designer = EMPLOYEES.find((e) => e.slug === post.designer);
   const approver = EMPLOYEES.find((e) => e.slug === post.approved_by);
 
+  const canSchedule = SCHEDULABLE.includes(post.status);
+
   return (
-    <div className="rounded-lg border border-border bg-surface p-2.5 shadow-card">
+    <div
+      onClick={() => actions.onOpen(post)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          actions.onOpen(post);
+        }
+      }}
+      title="คลิกเพื่อดูโพสต์เต็ม"
+      className="cursor-pointer rounded-lg border border-border bg-surface p-2.5 shadow-card transition hover:border-accent/50 hover:shadow-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+    >
       <div className="flex items-center gap-1.5">
         <PlatformIcon platform={post.platform} size={16} />
         <StatusPill status={post.status} />
@@ -397,7 +463,7 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
       )}
 
       {post.asset_prompt && (
-        <details className="mt-1.5">
+        <details className="mt-1.5" onClick={(e) => e.stopPropagation()}>
           <summary className="cursor-pointer text-[10px] text-accent">
             🎨 Asset brief
           </summary>
@@ -433,13 +499,26 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
         </div>
       )}
 
-      <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/60 pt-1.5">
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="mt-2 flex items-center justify-between gap-2 border-t border-border/60 pt-1.5"
+      >
         <div className="flex -space-x-1.5">
           {writer && <Avatar employee={writer} size={18} />}
           {designer && <Avatar employee={designer} size={18} />}
           {approver && <Avatar employee={approver} size={18} />}
         </div>
         <div className="flex items-center gap-1.5">
+          {canSchedule && (
+            <button
+              onClick={() => actions.onOpen(post)}
+              disabled={actions.busyPostId === post.id}
+              className="rounded border border-violet-400/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] text-violet-200 hover:border-violet-300 disabled:opacity-50"
+              title={post.status === "scheduled" ? "แก้เวลาตั้งโพสต์" : "ตั้งเวลาโพสต์"}
+            >
+              {post.status === "scheduled" ? "📅 แก้เวลา" : "📅 ตั้งเวลา"}
+            </button>
+          )}
           {post.status === "scheduled" && (
             <button
               onClick={() => actions.onPostNow(post.id)}
@@ -494,6 +573,233 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
 }
 
 /**
+ * Build the dashboard URL for a local asset path. social-posts.json stores
+ * paths like "outputs/content/foo.png"; the `/api/outputs/file/[...path]`
+ * route mounts UNDER outputs/, so strip the leading "outputs/" first.
+ */
+function buildAssetUrl(p: string): string {
+  const stripped = p.replace(/^outputs\//, "");
+  return "/api/outputs/file/" + stripped.split("/").map(encodeURIComponent).join("/");
+}
+
+/** Format a Date into the value a <input type="datetime-local"> expects (local wall-clock). */
+function toLocalInputValue(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * Full-post preview modal. Shows the complete copy, full-size asset (image or
+ * inline video player) and all metadata that the compact card truncates — and,
+ * for any not-yet-published post, an inline scheduler (datetime picker → set
+ * status=scheduled + push to Sheets).
+ */
+function PostPreviewModal({
+  post,
+  busy,
+  onClose,
+  onSchedule,
+}: {
+  post: Post;
+  busy: boolean;
+  onClose: () => void;
+  onSchedule: (postId: string, iso: string) => Promise<boolean>;
+}) {
+  const writer = EMPLOYEES.find((e) => e.slug === post.writer);
+  const designer = EMPLOYEES.find((e) => e.slug === post.designer);
+  const approver = EMPLOYEES.find((e) => e.slug === post.approved_by);
+  const canSchedule = SCHEDULABLE.includes(post.status);
+
+  const assetUrl = post.asset_file ? buildAssetUrl(post.asset_file) : null;
+  const isVideo = !!post.asset_file && /\.(mp4|mov|webm|m4v)$/i.test(post.asset_file);
+  const isImage = !!post.asset_file && /\.(png|jpe?g|webp|gif|avif|heic|heif)$/i.test(post.asset_file);
+
+  // Default the picker to the existing schedule (in local time) or now+1h.
+  const defaultWhen = useMemo(() => {
+    if (post.scheduled_at && !Number.isNaN(Date.parse(post.scheduled_at))) {
+      return toLocalInputValue(new Date(post.scheduled_at));
+    }
+    const d = new Date();
+    d.setHours(d.getHours() + 1, 0, 0, 0);
+    return toLocalInputValue(d);
+  }, [post.scheduled_at]);
+  const [when, setWhen] = useState(defaultWhen);
+
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  const submit = async () => {
+    if (!when || busy) return;
+    const iso = new Date(when).toISOString();
+    const ok = await onSchedule(post.id, iso);
+    if (ok) onClose();
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm sm:items-center"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="my-auto w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-2xl"
+      >
+        {/* header */}
+        <div className="flex items-center gap-2 border-b border-border px-4 py-3">
+          <PlatformIcon platform={post.platform} size={18} />
+          <StatusPill status={post.status} />
+          {post.campaign && (
+            <span className="rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-ink-dim">
+              {post.campaign}
+            </span>
+          )}
+          <button
+            onClick={onClose}
+            className="ml-auto rounded-md px-2 py-0.5 text-lg leading-none text-ink-dim hover:bg-surface-2 hover:text-ink"
+            title="ปิด (Esc)"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="max-h-[80vh] overflow-y-auto px-4 py-3">
+          <h3 className="text-sm font-semibold leading-snug text-ink">{post.title}</h3>
+
+          {assetUrl && isVideo && (
+            // eslint-disable-next-line jsx-a11y/media-has-caption
+            <video
+              src={assetUrl}
+              controls
+              className="mt-3 max-h-[55vh] w-full rounded-lg border border-border bg-black"
+            />
+          )}
+          {assetUrl && isImage && (
+            <a href={assetUrl} target="_blank" rel="noreferrer" title="เปิดรูปต้นฉบับ">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={assetUrl}
+                alt={post.title}
+                className="mt-3 max-h-[55vh] w-full rounded-lg border border-border object-contain"
+              />
+            </a>
+          )}
+          {assetUrl && !isVideo && !isImage && (
+            <a
+              href={assetUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-3 flex items-center gap-1.5 rounded-md border border-border bg-surface-2/40 px-2 py-1.5 text-[11px] text-ink-dim hover:text-accent"
+            >
+              📎 {post.asset_file?.split("/").pop()}
+            </a>
+          )}
+
+          <p className="mt-3 whitespace-pre-line text-[12.5px] leading-relaxed text-ink">
+            {post.copy}
+          </p>
+
+          {post.asset_prompt && (
+            <div className="mt-3 rounded-md bg-surface-2/40 p-2">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-ink-dim">
+                🎨 Asset brief
+              </p>
+              <p className="mt-1 whitespace-pre-line text-[11px] italic leading-snug text-ink-dim">
+                {post.asset_prompt}
+              </p>
+            </div>
+          )}
+
+          {post.notes && (
+            <div className="mt-3 rounded-md border border-amber-400/30 bg-amber-500/10 p-2 text-[11px] leading-snug text-amber-200">
+              <span className="font-semibold">📝 Notes: </span>
+              <span className="whitespace-pre-line">{post.notes}</span>
+            </div>
+          )}
+
+          {(post.scheduled_at || post.published_at) && (
+            <p className="mt-3 text-[11px] text-ink-dim">
+              {post.published_at
+                ? `เผยแพร่: ${fmtDate(post.published_at)}`
+                : post.scheduled_at
+                  ? `ตั้งเวลาไว้: ${fmtDate(post.scheduled_at)}`
+                  : ""}
+            </p>
+          )}
+
+          {post.engagement && (
+            <div className="mt-3 grid grid-cols-4 gap-1 rounded bg-surface-2/40 p-2 text-[11px]">
+              <Stat label="❤" value={post.engagement.likes} />
+              <Stat label="💬" value={post.engagement.comments} />
+              <Stat label="↗" value={post.engagement.shares} />
+              <Stat label="👁" value={post.engagement.views} />
+            </div>
+          )}
+
+          {post.error_log && (
+            <div className="mt-3 rounded border border-rose-400/40 bg-rose-500/10 px-2 py-1.5 text-[11px] text-rose-200">
+              <p className="font-medium">
+                🔴 ยิงไม่ออก{post.attempt_count ? ` · ลอง ${post.attempt_count} ครั้ง` : ""}
+              </p>
+              <p className="mt-0.5 whitespace-pre-line opacity-80">{post.error_log}</p>
+            </div>
+          )}
+
+          <div className="mt-3 flex items-center gap-3 border-t border-border/60 pt-2 text-[10px] text-ink-dim">
+            {writer && <span>✍ {writer.firstName}</span>}
+            {designer && <span>🎨 {designer.firstName}</span>}
+            {approver && <span>✓ {approver.firstName}</span>}
+            <span className="ml-auto font-mono opacity-60">{post.id}</span>
+          </div>
+
+          {/* Scheduler */}
+          {canSchedule && (
+            <div className="mt-3 rounded-lg border border-violet-400/30 bg-violet-500/5 p-3">
+              <p className="text-[11px] font-semibold text-violet-200">
+                📅 {post.status === "scheduled" ? "แก้เวลาตั้งโพสต์" : "ตั้งเวลาโพสต์"}
+              </p>
+              <p className="mt-0.5 text-[10px] text-ink-dim">
+                ตั้งแล้ว Apps Script จะโพสต์ขึ้น Facebook เองเมื่อถึงเวลา (เช็คทุก 5 นาที)
+              </p>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <input
+                  type="datetime-local"
+                  value={when}
+                  onChange={(e) => setWhen(e.target.value)}
+                  className="rounded-md border border-border bg-surface px-2 py-1 text-[12px] text-ink [color-scheme:dark]"
+                />
+                <button
+                  onClick={submit}
+                  disabled={busy || !when}
+                  className="rounded-md bg-violet-500/80 px-3 py-1 text-[12px] font-medium text-white hover:bg-violet-500 disabled:opacity-50"
+                >
+                  {busy ? "กำลังตั้ง…" : post.status === "scheduled" ? "อัปเดตเวลา" : "เข้า schedule"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {post.external_url && (
+            <a
+              href={post.external_url}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-3 inline-block text-[12px] text-accent hover:underline"
+            >
+              เปิดโพสต์บน Facebook ↗
+            </a>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Render the post's image asset (or a file chip if it's a non-image).
  * `path` comes from social-posts.json as something like
  *   "outputs/content/foo.png" — the `/api/outputs/file/[...path]` route
@@ -504,10 +810,7 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
 function AssetPreview({ path, alt }: { path: string; alt?: string }) {
   const [hidden, setHidden] = useState(false);
   const isImage = /\.(png|jpe?g|webp|gif|avif|heic|heif)$/i.test(path);
-  const stripped = path.replace(/^outputs\//, "");
-  const url =
-    "/api/outputs/file/" +
-    stripped.split("/").map(encodeURIComponent).join("/");
+  const url = buildAssetUrl(path);
   if (hidden) return null;
   if (!isImage) {
     return (
@@ -517,6 +820,7 @@ function AssetPreview({ path, alt }: { path: string; alt?: string }) {
           href={url}
           target="_blank"
           rel="noreferrer"
+          onClick={(e) => e.stopPropagation()}
           className="truncate hover:text-accent"
           title={path}
         >
@@ -530,6 +834,7 @@ function AssetPreview({ path, alt }: { path: string; alt?: string }) {
       href={url}
       target="_blank"
       rel="noreferrer"
+      onClick={(e) => e.stopPropagation()}
       className="mt-2 block overflow-hidden rounded-md border border-border bg-surface-2/40"
       title="คลิกเพื่อเปิดรูปต้นฉบับ"
     >
