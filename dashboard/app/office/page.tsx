@@ -6,7 +6,7 @@ import { CompanyProfile } from "@/lib/companyProfile";
 import { useJobStream, type ClientJob } from "@/lib/useJobStream";
 import { EMPLOYEES, type EmployeeSlug } from "@/lib/employees";
 import { KpiFile, KpiItem, pctOfTarget } from "@/components/kpi-utils";
-import OfficeScene from "@/components/OfficeScene";
+import OfficeGame from "@/components/OfficeGame";
 import OfficeConsole from "@/components/OfficeConsole";
 
 export default function OfficePage() {
@@ -172,7 +172,7 @@ export default function OfficePage() {
 
       {/* OFFICE FLOOR */}
       <div className="min-h-0 overflow-hidden">
-        <OfficeScene jobsBySlug={jobsBySlug} onOpenDirect={openDirect} />
+        <OfficeGame jobsBySlug={jobsBySlug} onOpenDirect={openDirect} />
       </div>
 
       {/* CONSOLE */}
