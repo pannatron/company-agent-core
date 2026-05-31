@@ -56,7 +56,8 @@ export default function DataView() {
   const [sheet, setSheet] = useState<SheetData | null>(null);
   const [loading, setLoading] = useState(false);
   const [review, setReview] = useState<ReviewSummary | null>(null);
-  const [toast] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const [pulling, setPulling] = useState(false);
 
   const loadSheet = useCallback(async (key: SheetKey) => {
     setLoading(true);
@@ -70,6 +71,43 @@ export default function DataView() {
       setLoading(false);
     }
   }, []);
+
+  // Pull the currently-open topic straight from Google Sheets → local CSV,
+  // then refresh the table. Lets the Data tab fetch fresh data without
+  // hopping over to the Files tab's Sheets panel.
+  const pullFromSheets = useCallback(
+    async (key: SheetKey) => {
+      const topic = key.replace(/\.csv$/, "");
+      setPulling(true);
+      setToast(null);
+      try {
+        const res = await fetch("/api/sheets/pull", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ topic }),
+        });
+        const data = (await res.json()) as {
+          pulled?: { id: string; rows: number }[];
+          errors?: { id: string; message: string }[];
+          error?: string;
+        };
+        if (!res.ok || data.error) {
+          setToast(`✗ pull ไม่สำเร็จ — ${data.error || `HTTP ${res.status}`}`);
+        } else if (data.errors?.length) {
+          setToast(`✗ ${data.errors[0].message}`);
+        } else {
+          const rows = data.pulled?.[0]?.rows ?? 0;
+          setToast(`✓ ดึงจาก Sheets แล้ว — ${rows} แถว`);
+        }
+        await loadSheet(key);
+      } catch (e) {
+        setToast(`✗ ${(e as Error).message}`);
+      } finally {
+        setPulling(false);
+      }
+    },
+    [loadSheet],
+  );
 
   const loadReview = useCallback(async () => {
     try {
@@ -102,6 +140,14 @@ export default function DataView() {
           ข้อมูลล่าสุดในชีตหลัก — กดดูได้ที่นี่โดยไม่ต้องเปิด Google Sheets
         </span>
         <div className="flex-1" />
+        <button
+          onClick={() => pullFromSheets(active)}
+          disabled={pulling}
+          title="ดึงข้อมูลล่าสุดจาก Google Sheets → เขียนทับ CSV แล้วโหลดใหม่"
+          className="rounded-md border border-accent/40 bg-accent/10 px-2.5 py-1 text-[11px] text-ink hover:border-accent disabled:opacity-50"
+        >
+          {pulling ? "⬇ กำลังดึง…" : "⬇ Pull จาก Sheets"}
+        </button>
         <button
           onClick={() => {
             loadSheet(active);
