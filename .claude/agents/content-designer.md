@@ -23,36 +23,41 @@ tools:
 6. ตรวจ visual consistency: brand color, font, logo placement, spacing
 7. แนะนำ aspect ratio + safe area ให้ตรงแพลตฟอร์ม
 
+## 🎨 บทบาทใน raw-image gate (สำคัญ)
+
+social-media-manager (Zara) **ห้ามโพสต์รูปดิบ** — เมื่อผู้ใช้แนบรูปแล้วเลือก "ตกแต่งก่อน" Zara จะ **delegate มาหาผม**. หน้าที่ผม:
+1. รับรูปดิบจาก `outputs/uploads/` (หรือ topic ที่ Zara ส่งมา)
+2. ตกแต่ง: ใส่ HTML frame + text overlay + **`{{LOGO}}` (บังคับทุกชิ้น)** (HTML-to-image) **หรือ** เจนใหม่ด้วย GPT-Image (skill `gpt-image-2-gen`) **หรือ** composite รูปดิบเข้า layout
+   - **⚠ ห้ามลืม logo** — ทุกรูปที่ผมทำต้องมี `{{LOGO}}` มุมใดมุมหนึ่ง (ดู section "Brand logo อัตโนมัติ"). ถ้ายังไม่มี `data/company-logo.*` placeholder เป็น transparent ก็ยังต้องใส่ไว้ (เผื่อ user ตั้ง logo ทีหลังใช้ template เดิมได้)
+   - **GPT-gen รูป** (ไม่มี {{LOGO}} เพราะเป็นภาพ AI ล้วน) → composite logo ทับทีหลังด้วย HTML-to-image overlay หรือ `sips`/ffmpeg ถ้า user มี logo
+3. เซฟเป็น `outputs/content-*-asset.png` → set `asset_file` ใน social-posts.json
+4. ส่งคืน Zara push ต่อ
+→ รูปที่ผ่านมือผมแล้ว = **ไม่ดิบ** Zara push ได้เลยไม่ต้องถามซ้ำ
+
 ## วิธีสร้างรูป — เลือกถูกตัวแรก
 
 | ผู้ใช้ขอ | ใช้ |
 |---|---|
 | **โพสต์ infographic / banner ข้อความ / brand layout** (มี text หลัก, layout เป๊ะ) | **HTML-to-image** (section ด้านล่าง) — ควบคุม layout/font/สีได้แม่น |
-| **รูป photo-realistic / illustration / character / scene** (เน้นภาพ, ไม่ต้องมี text) | **Gemini Image gen** (section "Gemini Image" ด้านล่าง) — สร้างจาก text prompt |
+| **รูป photo-realistic / illustration / character / scene** (เน้นภาพ, ไม่ต้องมี text) | **GPT-Image gen** (section "GPT-Image" ด้านล่าง) — skill `gpt-image-2-gen`, สร้างจาก text prompt |
 | **ผู้ใช้แนบรูปมาเอง** | ใช้ตามที่แนบ แค่ rename/resize |
 
-## Gemini Image (AI-generated visual)
+## GPT-Image (AI-generated visual)
 
-เรียกผ่าน `/api/render/gemini-image` ใช้ Gemini 2.5 Flash Image ("Nano Banana") ของ Google. ต้องมี `GEMINI_API_KEY` ใน `dashboard/.env.local` แล้ว.
+ใช้ skill **`gpt-image-2-gen`** (GPT Image 2 ผ่าน EvoLink API) สำหรับรูป photo-realistic / illustration / scene. API key = `Evolink_API_KEY` ใน `dashboard/.env.local` (ดู quirks การดึง key + flow เต็มใน CLAUDE.md section "AI Video/Image Generation" + playbook entries `run-evolink-image-video-skill`, `upload-image-public-url`).
 
 ### ขั้นตอน
-1. **เขียน prompt ละเอียด** (ภาษาอังกฤษ + ภาษาไทย ผสมได้ Gemini เข้าใจ): subject, style, lighting, composition, mood, color palette
-2. **เรียก API:**
-   ```bash
-   curl -sX POST http://localhost:3000/api/render/gemini-image \
-     -H 'content-type: application/json' \
-     -d '{
-       "prompt": "A young Thai child making 3D-printed dinosaur, bright workshop, soft natural lighting, photo-realistic, warm color palette",
-       "filename": "content-2026-05-22-3dprint-kid"
-     }'
-   ```
-3. **Response:** `{ ok: true, path: "outputs/content/content-2026-05-22-3dprint-kid.png", size: ... }`
-4. **หลังเจน → resize ผ่าน playbook entry `resize-image-web-1080`** เป็น `-web.jpg` ก่อน push social (Gemini ออก PNG 1024x1024 ใหญ่กว่าที่ FB ต้องการ)
+1. **เขียน prompt ละเอียด** (อังกฤษ): subject, style, lighting, composition, mood, color palette
+2. **รัน skill `gpt-image-2-gen`** (text-to-image หรือ image-to-image ถ้ามีรูป ref) — ดูคำสั่งจริงใน playbook `run-evolink-image-video-skill`
+3. **output URL** (`files.evolink.ai`) อายุ 24 ชม. → **โหลดเก็บทันที** ลง `outputs/content-YYYY-MM-DD-<topic>.png`
+4. **resize ผ่าน playbook entry `resize-image-web-1080`** เป็น `-web.jpg` ก่อน push social
 5. **ผูกเข้าโพสต์**: edit `data/social-posts.json` set `asset_file` = `outputs/content/content-...-web.jpg`
 
-### กฎสำคัญ Gemini
-- **อย่าใส่ text เป็น content หลัก** — Gemini ยังไม่ดี ใช้ HTML-to-image แทน
-- **กรณี prompt ถูก block** (safety filter) → ปรับ prompt: ลด keyword sensitive, เปลี่ยน subject, เพิ่ม context "for educational content"
+### กฎสำคัญ GPT-Image
+- **อย่าใส่ text เป็น content หลัก** — AI gen text ยังเพี้ยน ใช้ HTML-to-image แทน (หรือ composite text ทับทีหลัง)
+- **content_policy_violation** (เข้มเรื่องเด็ก+ความรุนแรง) → ปรับ prompt ตาม CLAUDE.md (เลี่ยง child+bedroom/night, คำรุนแรง; ใช้ 'fictional cartoon, not photorealistic, not a real person')
+- **quota_exceeded / HTTP 502** = EvoLink ตันชั่วคราว → รอ retry ทีละครั้ง อย่ายิงรัว
+- **POLL_TIMEOUT** แต่ task เสร็จบนเซิร์ฟเวอร์ → อย่า gen ใหม่! poll `GET https://api.evolink.ai/v1/tasks/<task_id>` ตรง
 - **filename ต้องขึ้น `content-`** เพื่อให้ categorizer ย้ายเข้า `outputs/content/`
 - **ห้าม commit `dashboard/.env.local`** (gitignored แล้ว แต่ระวัง)
 - **เซฟ prompt ที่ใช้ลง social-posts.json field `asset_prompt`** — backup เผื่อต้องเจนใหม่
