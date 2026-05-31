@@ -10,6 +10,7 @@ type PostStatus =
   | "ready_for_review"
   | "approved"
   | "scheduled"
+  | "publishing"
   | "published"
   | "failed";
 
@@ -74,7 +75,7 @@ const SCHEDULABLE: PostStatus[] = ["draft", "ready_for_review", "approved", "sch
 
 const COLUMNS: { key: PostStatus | "in_progress"; label: string; statuses: PostStatus[] }[] = [
   { key: "in_progress", label: "ร่าง / กำลังทำ", statuses: ["draft", "ready_for_review", "approved"] },
-  { key: "scheduled", label: "ตั้งเวลาแล้ว", statuses: ["scheduled", "failed"] },
+  { key: "scheduled", label: "ตั้งเวลาแล้ว", statuses: ["scheduled", "publishing", "failed"] },
   { key: "published", label: "เผยแพร่แล้ว", statuses: ["published"] },
 ];
 
@@ -85,6 +86,7 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
   const [busyPostId, setBusyPostId] = useState<string | null>(null);
   const [actionToast, setActionToast] = useState<string | null>(null);
   const [previewId, setPreviewId] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -101,6 +103,27 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
   }, [refreshSignal, localBump]);
 
   const reload = () => setLocalBump((n) => n + 1);
+
+  /** Manual refresh: pull the sheet (FB scheduler writes status back there) then
+   *  reload the view, so newly-published/processing posts show without waiting
+   *  for the 45s auto-poll. */
+  const onRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setActionToast(null);
+    try {
+      const r = await fetch("/api/social/sheet/pull", { method: "POST" });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        setActionToast(`✗ refresh ไม่สำเร็จ: ${d.error || `HTTP ${r.status}`}`);
+      }
+    } catch (e) {
+      setActionToast(`✗ refresh ไม่สำเร็จ: ${(e as Error).message}`);
+    } finally {
+      setRefreshing(false);
+      reload();
+    }
+  };
 
   // BUG-007: Apps Script publishes scheduled posts on its own (every 5 min)
   // and writes status=published back to the Sheet, but the dashboard never
@@ -151,6 +174,11 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
       const d = await r.json();
       if (!r.ok || d.ok === false) {
         setActionToast(`✗ ${d.error || `HTTP ${r.status}`}`);
+        // Post may already be mid-publish on the server (scheduler grabbed it
+        // first). Pull the sheet so its "publishing" status + spinner show,
+        // instead of a stale "scheduled" card the user keeps clicking.
+        await fetch("/api/social/sheet/pull", { method: "POST" }).catch(() => {});
+        reload();
       } else {
         setActionToast(`✓ โพสต์ขึ้น Facebook แล้ว — ${d.external_url || ""}`);
         // Pull sheet back so local JSON reflects new status/external_url
@@ -195,6 +223,7 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
       ready_for_review: "รอ review",
       approved: "approved",
       scheduled: "ตั้งเวลา",
+      publishing: "กำลังเผยแพร่",
       published: "เผยแพร่แล้ว",
       failed: "ยิงไม่ออก",
     };
@@ -291,12 +320,23 @@ export default function SocialView({ refreshSignal, onPromptCreatorTeam }: Props
             {data?.posts.length ?? 0} โพสต์ทั้งหมด · อัปเดต {data?.updated_at ?? "—"}
           </p>
         </div>
-        <button
-          onClick={onPromptCreatorTeam}
-          className="rounded-lg bg-accent-soft px-3 py-1.5 text-xs font-medium text-white hover:bg-accent"
-        >
-          + ขอ creator team สร้างโพสต์
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            onClick={onRefresh}
+            disabled={refreshing}
+            title="ดึงสถานะล่าสุดจาก Sheet (FB scheduler เขียน status กลับที่นั่น)"
+            className="flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-1.5 text-xs font-medium text-ink-dim hover:border-accent hover:text-ink disabled:opacity-50"
+          >
+            <span className={refreshing ? "inline-block animate-spin" : "inline-block"}>↻</span>
+            {refreshing ? "กำลังรีเฟรช…" : "รีเฟรช"}
+          </button>
+          <button
+            onClick={onPromptCreatorTeam}
+            className="rounded-lg bg-accent-soft px-3 py-1.5 text-xs font-medium text-white hover:bg-accent"
+          >
+            + ขอ creator team สร้างโพสต์
+          </button>
+        </div>
       </header>
 
       <FBPanel refreshSignal={refreshSignal + localBump} />
@@ -509,6 +549,15 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
           {approver && <Avatar employee={approver} size={18} />}
         </div>
         <div className="flex items-center gap-1.5">
+          {post.status === "publishing" && (
+            <span
+              className="inline-flex items-center gap-1 rounded border border-sky-400/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-200"
+              title="กำลังเผยแพร่ขึ้น Facebook — รอสักครู่ อย่ากดซ้ำ"
+            >
+              <span className="h-2.5 w-2.5 animate-spin rounded-full border border-sky-300/40 border-t-sky-200" />
+              กำลังเผยแพร่…
+            </span>
+          )}
           {canSchedule && (
             <button
               onClick={() => actions.onOpen(post)}
@@ -542,7 +591,7 @@ function PostCard({ post, actions }: { post: Post; actions: CardActions }) {
           {/* Delete — visible for everything except already-published posts.
               Drafts/scheduled/failed get a one-click cleanup; published is
               skipped here on purpose (use Facebook directly for that). */}
-          {post.status !== "published" && (
+          {post.status !== "published" && post.status !== "publishing" && (
             <button
               onClick={() => actions.onDelete(post)}
               disabled={actions.busyPostId === post.id}
@@ -756,6 +805,13 @@ function PostPreviewModal({
             <span className="ml-auto font-mono opacity-60">{post.id}</span>
           </div>
 
+          {post.status === "publishing" && (
+            <div className="mt-3 flex items-center gap-2 rounded-lg border border-sky-400/30 bg-sky-500/5 p-3 text-[11px] text-sky-200">
+              <span className="h-3 w-3 animate-spin rounded-full border border-sky-300/40 border-t-sky-200" />
+              กำลังเผยแพร่ขึ้น Facebook — รอสักครู่ อย่ากดซ้ำ
+            </div>
+          )}
+
           {/* Scheduler */}
           {canSchedule && (
             <div className="mt-3 rounded-lg border border-violet-400/30 bg-violet-500/5 p-3">
@@ -865,10 +921,11 @@ function StatusPill({ status }: { status: PostStatus }) {
     ready_for_review: { label: "review", cls: "bg-amber-500/15 text-amber-200" },
     approved: { label: "approved", cls: "bg-cyan-500/15 text-cyan-200" },
     scheduled: { label: "scheduled", cls: "bg-violet-500/15 text-violet-200" },
+    publishing: { label: "publishing", cls: "bg-sky-500/20 text-sky-200 animate-pulse" },
     published: { label: "published", cls: "bg-emerald-500/15 text-emerald-200" },
     failed: { label: "failed", cls: "bg-rose-500/20 text-rose-200" },
   };
-  const m = map[status];
+  const m = map[status] ?? { label: status, cls: "bg-ink-dim/15 text-ink-dim" };
   return (
     <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wider ${m.cls}`}>
       {m.label}
