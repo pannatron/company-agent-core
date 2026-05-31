@@ -39,6 +39,8 @@ export interface ReviewSummary {
   changed_count: number;
   outputs: OutputReviewFile[];
   outputs_pending_count: number;
+  /** Drive root folder URL where uploads land — for an "open folder" button. */
+  drive_root_url?: string;
 }
 
 interface ReviewPreview {
@@ -332,13 +334,26 @@ export function ReviewModal({
               {" — "}ติ๊กเพื่อเลือกที่จะอัพขึ้นคลาวด์
             </p>
           </div>
-          <button
-            onClick={onClose}
-            className="rounded p-1 text-ink-dim hover:bg-surface-2 hover:text-ink"
-            aria-label="close"
-          >
-            ✕
-          </button>
+          <div className="flex shrink-0 items-center gap-2">
+            {review.drive_root_url && (
+              <a
+                href={review.drive_root_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="เปิดโฟลเดอร์ปลายทางบน Google Drive ที่เก็บไฟล์ที่อัพแล้ว"
+                className="rounded-md border border-accent/40 bg-accent/10 px-2.5 py-1 text-[11px] font-medium text-accent hover:bg-accent/20"
+              >
+                ↗ เปิดโฟลเดอร์บน Drive
+              </a>
+            )}
+            <button
+              onClick={onClose}
+              className="rounded p-1 text-ink-dim hover:bg-surface-2 hover:text-ink"
+              aria-label="close"
+            >
+              ✕
+            </button>
+          </div>
         </header>
 
         <div className="grid min-h-0 flex-1 grid-cols-[280px_1fr]">

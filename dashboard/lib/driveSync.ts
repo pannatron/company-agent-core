@@ -268,12 +268,15 @@ export async function syncAll(opts?: {
       const rel = path.relative(OUTPUTS_DIR, full).split(path.sep);
       const categoryId = rel.length > 1 ? rel[0] : "misc";
       const fileName = rel[rel.length - 1];
+      // Path segments between the category folder and the file, e.g.
+      // outputs/content/borot-series/ep1/foo.mp4 → ["borot-series","ep1"].
+      const midPath = rel.slice(1, -1).join("/");
       const stat = await fs.stat(full);
       const baseKey = repoRel;
 
       const cat = getCategory(categoryId);
       const folderName = `${cat.icon} ${cat.label}`;
-      const destinations = resolveDestinations(cat, fileName);
+      const destinations = resolveDestinations(cat, fileName, midPath);
 
       // Lazy-read file body — only fetch if at least one destination needs upload
       let buf: Buffer | null = null;
@@ -341,7 +344,14 @@ interface UploadDestination {
 
 /**
  * Decide where on Drive a file should land (one or more locations).
- * Behavior matrix:
+ *
+ * Bucket categories (payslips/wage/expense/income) derive their subfolders
+ * from the filename (date/person) and may fan out to two folders — keep that.
+ * Everything else mirrors the file's local nested path (`midPath`) so e.g.
+ * outputs/content/borot-series/ep1/foo.mp4 lands in 📝 Content/borot-series/ep1/
+ * on Drive instead of being dumped flat in the category root.
+ *
+ * Behavior matrix (bucket cats):
  *   - bucketByMonth + bucketByPerson + has both → dual: _by-person/<p>/<m> + _by-month/<m>
  *   - bucketByPerson alone + has person         → _by-person/<p>
  *   - bucketByMonth alone + has month           → <m>
@@ -350,6 +360,7 @@ interface UploadDestination {
 function resolveDestinations(
   cat: { bucketByMonth?: boolean; bucketByPerson?: boolean },
   fileName: string,
+  midPath = "",
 ): UploadDestination[] {
   if (cat.bucketByPerson && cat.bucketByMonth) {
     const { person, month } = extractPersonAndMonth(fileName);
@@ -373,7 +384,8 @@ function resolveDestinations(
       ? [{ tag: "person", subfolder: `_by-person/${person}` }]
       : [{ tag: "root" }];
   }
-  return [{ tag: "root" }];
+  // Non-bucket category → mirror the local nested path under the category root.
+  return [{ tag: "root", ...(midPath ? { subfolder: midPath } : {}) }];
 }
 
 export async function getSyncedMap(): Promise<Record<string, FileSyncEntry>> {
@@ -777,6 +789,8 @@ export interface ReviewSummary {
   outputs: OutputReviewFile[];
   /** Count of pending outputs (new + modified). */
   outputs_pending_count: number;
+  /** Drive root folder URL where uploads land — for an "open folder" button. */
+  drive_root_url?: string;
 }
 
 /* Cached lookup helpers so we can include a "open in Drive" URL per file. */
@@ -906,7 +920,10 @@ export async function getOutputsReview(): Promise<OutputReviewFile[]> {
  */
 export async function getReviewSummary(): Promise<ReviewSummary> {
   const state = await loadReviewState();
-  const outputs = await getOutputsReview();
+  const [outputs, driveRootUrl] = await Promise.all([
+    getOutputsReview(),
+    loadDriveRootUrl(),
+  ]);
   const outputsPending = outputs.length;
   const empty: ReviewSummary = {
     pending: outputsPending > 0,
@@ -915,6 +932,7 @@ export async function getReviewSummary(): Promise<ReviewSummary> {
     changed_count: 0,
     outputs,
     outputs_pending_count: outputsPending,
+    drive_root_url: driveRootUrl,
   };
   if (!state.checkpoint_snapshot_ts) return empty;
 
@@ -928,11 +946,8 @@ export async function getReviewSummary(): Promise<ReviewSummary> {
   }
 
   // Pre-fetch URL lookups once (state files are small) so each file gets
-  // enriched without N round-trips.
-  const [sheetsState, driveRootUrl] = await Promise.all([
-    loadSheetsState(),
-    loadDriveRootUrl(),
-  ]);
+  // enriched without N round-trips. driveRootUrl already loaded above.
+  const sheetsState = await loadSheetsState();
 
   const files: ReviewDiffFile[] = [];
   let changed = 0;
@@ -1002,6 +1017,7 @@ export async function getReviewSummary(): Promise<ReviewSummary> {
     changed_count: changed,
     outputs,
     outputs_pending_count: outputsPending,
+    drive_root_url: driveRootUrl,
   };
 }
 
