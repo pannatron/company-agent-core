@@ -180,6 +180,36 @@ agent: [...append post, push sheet via curl entry...]
 
 ครั้งแรก seed มี 3 entries: `resize-image-web-1080`, `schedule-at-now-plus-n-min-th`, `push-social-sheet` — entries จะเติมเองตามที่ agent ใช้งานจริง
 
+## AI Video/Image Generation (EvoLink: gpt-image-2-gen + seedance-2-video-gen)
+
+ใช้ทำคลิปแอนิเมชันเป็น series (เช่น Borot เด็กผจญภัยโลกเสมือน). บทเรียนจริง + flow ที่ work (ดูคำสั่งเต็มใน `data/playbook.json` entries: `storyboard-3x3-grid-to-video`, `video-gen-mandatory-inputs-rule`, `run-evolink-image-video-skill`, `upload-image-public-url`).
+
+### Pipeline หลัก (3x3 grid method)
+1. **LOCK ตัวละครก่อนเริ่ม series** — gen character turnaround sheet (3x3: front/3-4/side/back/expressions) ต่อ 1 ตัว เก็บเป็น canonical ref ถาวร (`outputs/content/borot-series/*-sheet*.png`)
+2. **gen storyboard grid ของแต่ละ EP** — GPT-Image 3x3 (9 ฉาก) รูปเดียว, ใส่ character sheets เป็น `--image` ref (คงตัวละคร)
+3. **gen video** — Seedance, โยน grid → คลิป montage 15s
+
+### ⛔ กฎเหล็ก: ห้าม gen วิดีโอทันที (ยิ่ง EP ต่อเนื่อง)
+video input ต้องมีครบ **3 องค์ประกอบ** เสมอ:
+1. **เฟรมท้ายวิดีโอ EP ก่อนหน้า** (snap: `ffmpeg -y -sseof -0.4 -i ep.mp4 -update 1 -frames:v 1 lf.png`) — ความต่อเนื่อง
+2. **character sheet ตัวละครหลักทุกตัว** — กัน drift
+3. **storyboard grid ของ EP นั้น** — คุมเนื้อเรื่อง
+
+แล้วยิง **Seedance reference mode** (3-9 รูป): `--mode reference --image "<lastframe>,<kid_sheet>,<borot_sheet>,<ep_grid>"` + prompt อ้างรูปตามเลข ("begin from image 1; boy=image 2; mascot=image 3; follow storyboard image 4"). EP แรกไม่มีเฟรมก่อน → video = โยน grid montage.
+
+### ปัญหาที่เจอ + วิธีแก้ (สำคัญ — อย่าลองผิดซ้ำ)
+- **ตัวละคร drift/เพี้ยน** = ใช้ image-to-video (1-2 รูป) คุม character ไม่ได้ → ต้อง **reference mode** ใส่ sheet ด้วยทุกครั้ง
+- **API ดึงรูป input ไม่ได้** (`image_processing_error: try a different host`) = **catbox.moe EvoLink ดึงไม่ได้** (HEAD content-length:0). ใช้ **x0.at** (`curl -F "file=@f" https://x0.at`). 0x0.st ตายแล้ว, telegra.ph reject, tmpfiles DNS ไม่ resolve
+- **API key** อยู่ `dashboard/.env.local` ชื่อ var `Evolink_API_KEY` (ตัวพิมพ์ผสม! ไม่ใช่ EVOLINK_API_KEY). `set -a; . file; set +a` มัก**ได้ค่าว่าง** (source flaky) → ใช้ grep-extract: `KEY=$(grep -i '^[[:space:]]*Evolink_API_KEY[[:space:]]*=' dashboard/.env.local | head -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/^["'"'"']//; s/["'"'"']$//' | tr -d '\r\n'); export EVOLINK_API_KEY="$KEY"`
+- **content_policy_violation** (GPT-Image เข้มเรื่องเด็ก+ความรุนแรง) → เลี่ยง 'child/kid + bedroom/night', คำรุนแรง (attacks/blasts/shatter/clash/mech combat). ใช้ 'fictional cartoon adventurer, not photorealistic, not a real person' + ฉาก daytime + tone wholesome/non-violent (บอส = อุปสรรค แก้ด้วยความฉลาด ไม่ใช่ต่อสู้)
+- **quota_exceeded / HTTP 502** = EvoLink route ตันชั่วคราว (ไม่ใช่บัคเรา) → **รอแล้ว retry ทีละครั้ง อย่ายิงรัว** (เคยพลาดยิงวิดีโอซ้อนหลายตัวตอน service ล่ม = เปลือง)
+- **script POLL_TIMEOUT** (video 6 นาที / image 5 นาที) แต่ task เสร็จบนเซิร์ฟเวอร์ → อย่า gen ใหม่! poll API ตรงเอง: `GET https://api.evolink.ai/v1/tasks/<task_id>` (ใช้ Monitor tool). recover URL จาก `.results[0]`
+- **jq พังกับ response บางตัว** (`control characters must be escaped` — API ใส่ raw newline/dup keys ตอน error) → ใช้ `python3 -c "import json..."` หรือ `grep -oE 'https://files\.evolink\.ai/[^" ]+\.(png|mp4)'` ดึง URL แทน
+- **task_id สับสน** = อย่าเดา/อย่าอ่าน log ก่อน submit เขียนเสร็จ. รอ `TASK_SUBMITTED:` ใน log ก่อน แล้วค่อย grep task_id จริง (ลบ log เก่าก่อน gen ใหม่ด้วย `rm -f`). เห็น `TASK_SUBMITTED` แล้ว = อย่ายิงซ้ำ
+- **output URL** (`files.evolink.ai`) อายุ 24 ชม. → โหลดเก็บทันที
+- **Seedance max 15s/คลิป** — อยากยาว >15s: crop grid เป็น 9 panel (cell 682px, ตัด caption band ล่าง ~140px) → animate ทีละ 4s → `ffmpeg concat`
+- **continuity ข้าม EP** = snap เฟรมท้าย EP ก่อน เป็น input EP ถัดไป (last-frame chaining) เสมอ
+
 ## Slash commands ที่มี
 
 - `/daily-standup` — สรุป pipeline + KPI + ticket ค้าง ทุกเช้า
