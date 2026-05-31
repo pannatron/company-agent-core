@@ -56,7 +56,7 @@ interface ChatRequest {
   dispatch?: boolean;
 }
 
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-4-7";
+const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-4-8";
 
 export async function POST(req: NextRequest) {
   let body: ChatRequest;

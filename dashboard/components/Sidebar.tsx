@@ -280,7 +280,7 @@ export default function TeamSidebar({
 
       {!collapsed && (
         <footer className="border-t border-border px-4 py-2 text-[10px] text-ink-dim/70">
-          Powered by <code className="text-accent">claude-opus-4-7</code>
+          Powered by <code className="text-accent">claude-opus-4-8</code>
         </footer>
       )}
     </aside>
