@@ -173,6 +173,45 @@ export async function postNow(post_id: string): Promise<{
 }
 
 /**
+ * Check a Facebook video's processing state + real feed permalink (v12).
+ * `video_id` is the numeric id from a /videos/<id> external_url.
+ */
+export async function videoStatus(video_id: string): Promise<{
+  video_id: string;
+  video_status: string | null;
+  processing_progress: number | null;
+  published: boolean | null;
+  permalink_url: string;
+}> {
+  const url = await loadDriveUrl();
+  const r = await callScript<{
+    ok: boolean;
+    error?: string;
+    video_id?: string;
+    video_status?: string | null;
+    processing_progress?: number | null;
+    published?: boolean | null;
+    permalink_url?: string;
+  }>(url, { action: "fb_video_status", video_id });
+  if (!r.ok) {
+    const msg = r.error || "fb_video_status failed";
+    if (/unknown action/i.test(msg)) {
+      throw new Error(
+        "Apps Script ของคุณยังไม่ใช่ v12 — ก๊อปสคริปต์ใหม่จาก Files tab แล้ว redeploy",
+      );
+    }
+    throw new Error(msg);
+  }
+  return {
+    video_id: r.video_id || video_id,
+    video_status: r.video_status ?? null,
+    processing_progress: r.processing_progress ?? null,
+    published: r.published ?? null,
+    permalink_url: r.permalink_url || "",
+  };
+}
+
+/**
  * Reset a failed row back to status=scheduled with attempt_count=0 so the
  * next scheduler pass will retry it (BUG-003 retry helper).
  */

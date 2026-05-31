@@ -1473,6 +1473,10 @@ function mimeForExt(ext: string): string {
     ".webp": "image/webp",
     ".gif": "image/gif",
     ".html": "text/html",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".m4v": "video/x-m4v",
+    ".webm": "video/webm",
   };
   return map[ext.toLowerCase()] || "application/octet-stream";
 }
@@ -1503,9 +1507,21 @@ export function extractFolderId(url: string): string | null {
 export function buildAppsScriptTemplate(targetFolderId?: string): string {
   const baked = (targetFolderId ?? "").trim();
   return `/**
- * Virtual AI Company — Drive Sync receiver  (v10)
+ * Virtual AI Company — Drive Sync receiver  (v12)
  *
- * What's new in v10:
+ * What's new in v12:
+ *   - 🔗 วิดีโอ: ดึง permalink_url จริงจาก FB หลังอัพ แทน URL เดา /<page>/videos/<id>
+ *     (อันเก่าเปิดได้แต่ไม่ใช่ feed story → "ไม่ขึ้นหน้าเฟส"). fallback เป็น URL
+ *     เดิมถ้า FB ยังไม่ออก permalink
+ *   - 🆕 action "fb_video_status": GET status.video_status + permalink_url +
+ *     processing_progress ของ video id (เช็คว่า encode เสร็จยัง / เอา feed URL จริง)
+ *
+ * v11:
+ *   - 🎬 FIX วิดีโอยิงไม่ออก (OAuth 1366046 "อ่านรูปภาพไม่ได้"): media ทุกชนิด
+ *     เคยยิงเข้า /photos. ตอนนี้ auto-detect — วิดีโอ (mime video/* หรือ
+ *     นามสกุล .mp4/.mov/...) ไป /videos, รูปไป /photos เหมือนเดิม
+ *
+ * v10:
  *   - 🔒 FIX duplicate post bug: trigger overlap ทำให้แถวเดียวถูกยิง 2 ครั้ง
  *     a) LockService.getScriptLock() กั้น run ซ้อนกัน
  *     b) Row-level lock: เขียน status="publishing" + sheet.flush() ก่อน FB call
@@ -1530,7 +1546,7 @@ export function buildAppsScriptTemplate(targetFolderId?: string): string {
  *      (URL เดิม /exec ใช้ต่อได้ ไม่ต้องเปลี่ยน)
  */
 
-const SCRIPT_VERSION = "10";
+const SCRIPT_VERSION = "12";
 const MAX_ATTEMPTS = 3;
 const BACKUP_FOLDER_NAME = "⚙ Setup Backup";
 const FB_TRIGGER_FN = "runFbScheduler";
@@ -1781,6 +1797,30 @@ function doPost(e) {
       if (!body.post_id) return json_({ ok: false, error: "post_id required" });
       const result = fbResetRowImpl_(String(body.post_id));
       return json_(result);
+    }
+
+    if (body.action === "fb_video_status") {
+      if (!body.video_id) return json_({ ok: false, error: "video_id required" });
+      const cfg = fbConfig_();
+      if (!cfg.page_token) return json_({ ok: false, error: "ตั้ง FB Page Token ก่อน" });
+      const url = "https://graph.facebook.com/v18.0/" + String(body.video_id) +
+        "?fields=status,permalink_url,published,length&access_token=" +
+        encodeURIComponent(cfg.page_token);
+      const resp = UrlFetchApp.fetch(url, { method: "get", muteHttpExceptions: true });
+      const code = resp.getResponseCode();
+      const text = resp.getContentText();
+      if (code < 200 || code >= 300) return json_({ ok: false, error: "HTTP " + code + ": " + text });
+      const d = JSON.parse(text);
+      var permalink = d.permalink_url || "";
+      if (permalink && permalink.indexOf("http") !== 0) permalink = "https://www.facebook.com" + permalink;
+      return json_({
+        ok: true,
+        video_id: String(body.video_id),
+        video_status: d.status ? d.status.video_status : null,
+        processing_progress: d.status ? d.status.processing_progress : null,
+        published: d.published,
+        permalink_url: permalink,
+      });
     }
 
     return json_({ ok: false, error: "unknown action: " + body.action });
@@ -2265,16 +2305,23 @@ function fbResetRowImpl_(postId) {
 }
 
 /**
- * Publish to a Facebook Page. Three paths (priority: drive_id > image_url > text):
- *   1. drive_id present → DriveApp.getFileById().getBlob() → multipart upload to /photos
- *   2. image_url is HTTP(s) → FB crawls and attaches the URL
+ * Publish to a Facebook Page. Three paths (priority: drive_id > image_url > text).
+ * Media type is auto-detected — videos go to /videos, images to /photos, because
+ * posting a video to /photos fails with OAuth 1366046 "ไม่สามารถอ่านรูปภาพได้":
+ *   1. drive_id present → DriveApp blob → /videos (video mime) or /photos (image)
+ *   2. image_url is HTTP(s) → FB crawls; .mp4/.mov/... → /videos, else /photos
  *   3. Neither → text-only post to /feed
  */
 function publishToFb_(cfg, message, image_url, drive_id) {
-  if (drive_id) return publishPhotoFromDrive_(cfg, message, drive_id);
+  if (drive_id) return publishMediaFromDrive_(cfg, message, drive_id);
   const isUrl = image_url && /^https?:\\/\\//i.test(image_url);
-  if (isUrl) return publishPhotoFromUrl_(cfg, message, image_url);
+  if (isUrl) return publishMediaFromUrl_(cfg, message, image_url);
   return publishText_(cfg, message);
+}
+
+/** True when a filename/URL ends in a known video extension. */
+function isVideoName_(name) {
+  return /\\.(mp4|mov|m4v|webm|avi|mkv)(\\?|#|$)/i.test(String(name || ""));
 }
 
 function publishText_(cfg, message) {
@@ -2287,32 +2334,52 @@ function publishText_(cfg, message) {
   return parsePostResponse_(resp);
 }
 
-function publishPhotoFromUrl_(cfg, message, image_url) {
+function publishMediaFromUrl_(cfg, message, media_url) {
+  if (isVideoName_(media_url)) {
+    // FB fetches the remote file itself — no UrlFetchApp size cap here.
+    const endpoint = "https://graph.facebook.com/v18.0/" + cfg.page_id + "/videos";
+    const resp = UrlFetchApp.fetch(endpoint, {
+      method: "post",
+      payload: { access_token: cfg.page_token, file_url: media_url, description: message },
+      muteHttpExceptions: true,
+    });
+    return parseVideoResponse_(cfg, resp);
+  }
   const endpoint = "https://graph.facebook.com/v18.0/" + cfg.page_id + "/photos";
   const resp = UrlFetchApp.fetch(endpoint, {
     method: "post",
-    payload: { access_token: cfg.page_token, url: image_url, caption: message },
+    payload: { access_token: cfg.page_token, url: media_url, caption: message },
     muteHttpExceptions: true,
   });
   return parsePostResponse_(resp);
 }
 
-function publishPhotoFromDrive_(cfg, message, drive_id) {
-  var blob;
+function publishMediaFromDrive_(cfg, message, drive_id) {
+  var file, blob, ctype;
   try {
-    blob = DriveApp.getFileById(drive_id).getBlob();
+    file = DriveApp.getFileById(drive_id);
+    blob = file.getBlob();
+    ctype = blob.getContentType() || "";
   } catch (e) {
     throw new Error("Drive file ไม่พบ/เข้าถึงไม่ได้ (id=" + drive_id + "): " + e);
   }
+  const isVideo = ctype.indexOf("video/") === 0 || isVideoName_(file.getName());
   // UrlFetchApp encodes multipart/form-data when a Blob is included in payload
+  if (isVideo) {
+    // NOTE: UrlFetchApp caps the request body at ~50MB; clips larger than that
+    // will fail here — host the file and post via asset_url instead.
+    const endpoint = "https://graph.facebook.com/v18.0/" + cfg.page_id + "/videos";
+    const resp = UrlFetchApp.fetch(endpoint, {
+      method: "post",
+      payload: { access_token: cfg.page_token, description: message, source: blob },
+      muteHttpExceptions: true,
+    });
+    return parseVideoResponse_(cfg, resp);
+  }
   const endpoint = "https://graph.facebook.com/v18.0/" + cfg.page_id + "/photos";
   const resp = UrlFetchApp.fetch(endpoint, {
     method: "post",
-    payload: {
-      access_token: cfg.page_token,
-      caption: message,
-      source: blob,
-    },
+    payload: { access_token: cfg.page_token, caption: message, source: blob },
     muteHttpExceptions: true,
   });
   return parsePostResponse_(resp);
@@ -2330,6 +2397,41 @@ function parsePostResponse_(resp) {
   if (!postId) throw new Error("ไม่ได้ post_id กลับมา: " + text);
   // post_id format: "PAGE_ID_POST_ID" → facebook.com/PAGE_ID/posts/POST_ID
   return "https://www.facebook.com/" + postId.replace("_", "/posts/");
+}
+
+function parseVideoResponse_(cfg, resp) {
+  const code = resp.getResponseCode();
+  const text = resp.getContentText();
+  if (code < 200 || code >= 300) {
+    throw new Error("HTTP " + code + ": " + text);
+  }
+  const data = JSON.parse(text);
+  // /videos returns {id: VIDEO_ID} — no post_id is issued at upload time.
+  const vid = data.id;
+  if (!vid) throw new Error("ไม่ได้ video id กลับมา: " + text);
+  // Fetch the real feed permalink (FB issues it even while encoding). The bare
+  // /videos/<id> URL opens the viewer but isn't the timeline story, so the post
+  // looked "missing from the feed". Fall back to it only if FB has none yet.
+  const link = fbVideoPermalink_(cfg, vid);
+  return link || ("https://www.facebook.com/" + cfg.page_id + "/videos/" + vid);
+}
+
+/** GET a video's permalink_url. Returns "" on any failure (caller falls back). */
+function fbVideoPermalink_(cfg, video_id) {
+  try {
+    const url = "https://graph.facebook.com/v18.0/" + video_id +
+      "?fields=permalink_url&access_token=" + encodeURIComponent(cfg.page_token);
+    const resp = UrlFetchApp.fetch(url, { method: "get", muteHttpExceptions: true });
+    if (resp.getResponseCode() !== 200) return "";
+    const d = JSON.parse(resp.getContentText());
+    if (!d.permalink_url) return "";
+    // permalink_url is usually a site-relative path like "/page/videos/123/".
+    return d.permalink_url.indexOf("http") === 0
+      ? d.permalink_url
+      : "https://www.facebook.com" + d.permalink_url;
+  } catch (e) {
+    return "";
+  }
 }
 `;
 }
