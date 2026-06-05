@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { REPO_ROOT } from "@/lib/repo";
 import { CATEGORIES, getCategory, MISC_CATEGORY } from "@/lib/categorizer";
-import { getSyncedMap } from "@/lib/driveSync";
+import { getSyncedMap, isJunkOutput } from "@/lib/driveSync";
 import { mimeForExt } from "@/lib/mime";
 
 export const runtime = "nodejs";
@@ -29,6 +29,7 @@ export async function GET(req: NextRequest) {
         ...f,
         synced: !!synced,
         web_link: synced?.url,
+        junk: isJunkOutput(f.name),
       };
     })
     .sort((a, b) => b.mtime - a.mtime);

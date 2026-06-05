@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { REPO_ROOT } from "./repo";
-import { getCategory } from "./categorizer";
+import { getCategory, CATEGORIES } from "./categorizer";
 
 /**
  * Drive sync via Google Apps Script Web App.
@@ -1428,6 +1428,442 @@ export async function restoreFromDrive(): Promise<RestoreResult> {
   return result;
 }
 
+/* ============================================================
+ *   Outputs pull — reverse of syncAll: Drive → local outputs/
+ *
+ *   The mapping is derived from Drive's *folder structure*, not the local
+ *   .drive-state.json (which is machine-bound and gitignored). That means a
+ *   fresh server — or a different user — can pull as long as the Drive layout
+ *   matches: `<icon> <label>/<nested>/<file>` ↔ `outputs/<categoryId>/<nested>/<file>`.
+ * ============================================================ */
+
+interface ListOutputsResponse {
+  ok: boolean;
+  files?: {
+    folder_path: string;
+    filename: string;
+    file_id: string;
+    size: number;
+    mime?: string;
+    updated_at?: string;
+  }[];
+  root_url?: string;
+  error?: string;
+}
+
+export interface OutputPullFile {
+  /** outputs/-relative path the file maps to locally, e.g. "content/borot-series/ep1/ep1.mp4" */
+  path: string;
+  filename: string;
+  file_id: string;
+  size: number;
+  /** "missing" = server doesn't have it · "size_diff" = present but bytes differ */
+  status: "missing" | "size_diff";
+}
+
+export interface OutputsPullReview {
+  ok: boolean;
+  /** Pullable media files the server is missing or has at a different size. */
+  files: OutputPullFile[];
+  /** Count of files skipped as junk (logs/intermediates) — surfaced, not silent. */
+  junk_skipped: number;
+  /** Count of files already in sync (same size) and therefore omitted. */
+  synced: number;
+  error?: string;
+}
+
+/** Map "📝 Content" (icon + label, as used in the Drive category folder name)
+ *  back to the local category id ("content"). Built once from CATEGORIES. */
+function buildCategoryFolderMap(): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const c of CATEGORIES) {
+    m.set(`${c.icon} ${c.label}`, c.id);
+  }
+  return m;
+}
+
+/** Media/doc extensions worth pulling. Everything else (logs, shell scripts,
+ *  refs, intermediates) is treated as junk and filtered out of the review. */
+const PULLABLE_EXTS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".avif",
+  ".heic",
+  ".heif",
+  ".mp4",
+  ".mov",
+  ".webm",
+  ".m4v",
+  ".pdf",
+  ".md",
+  ".csv",
+]);
+
+/** True for build-byproduct / scratch files we never want to pull back. */
+export function isJunkOutput(name: string): boolean {
+  const lower = name.toLowerCase();
+  const ext = path.extname(lower);
+  if (!PULLABLE_EXTS.has(ext)) return true; // .log .txt .sh .mjs .b64 .json ...
+  if (name.startsWith("_")) return true; // _tmp-*, _bg.mjs, _o1.json ...
+  if (lower.startsWith("_tmp-") || lower.includes("-old") || lower.includes(".old."))
+    return true;
+  if (lower.startsWith("chk-") || lower.endsWith("-check.png")) return true;
+  return false;
+}
+
+/**
+ * Reverse-map a Drive listing to local outputs/ paths and diff against what the
+ * server already has. Returns only files that are missing or differ in size.
+ */
+export async function getOutputsPullReview(): Promise<OutputsPullReview> {
+  const cfg = await loadConfig();
+  if (!cfg) {
+    return {
+      ok: false,
+      files: [],
+      junk_skipped: 0,
+      synced: 0,
+      error: "Drive ยังไม่ได้เชื่อม",
+    };
+  }
+
+  const list = await callScript<ListOutputsResponse>(cfg.url, {
+    action: "list_outputs",
+  });
+  if (!list.ok) {
+    const msg = list.error || "list_outputs failed";
+    if (/unknown action/i.test(msg)) {
+      return {
+        ok: false,
+        files: [],
+        junk_skipped: 0,
+        synced: 0,
+        error:
+          "Apps Script ที่ deploy ยังไม่มี action 'list_outputs' — ก๊อปสคริปต์ใหม่จากปุ่มเชื่อม Drive แล้ว redeploy (New version)",
+      };
+    }
+    return { ok: false, files: [], junk_skipped: 0, synced: 0, error: msg };
+  }
+
+  const folderMap = buildCategoryFolderMap();
+  const files: OutputPullFile[] = [];
+  let junk = 0;
+  let synced = 0;
+
+  for (const f of list.files || []) {
+    if (isJunkOutput(f.filename)) {
+      junk++;
+      continue;
+    }
+    // folder_path on Drive: "📝 Content/borot-series/ep1" → ["📝 Content", "borot-series", "ep1"]
+    const segs = (f.folder_path || "").split("/").filter(Boolean);
+    if (segs.length === 0) continue; // file sat in Drive root — not a category output
+    const categoryId = folderMap.get(segs[0]);
+    if (!categoryId) continue; // not one of our category folders (e.g. Sheets folders)
+    const rest = segs.slice(1);
+    const outputsRel = [categoryId, ...rest, f.filename].join("/");
+    const localFull = path.join(OUTPUTS_DIR, ...[categoryId, ...rest, f.filename]);
+
+    let status: "missing" | "size_diff";
+    try {
+      const stat = await fs.stat(localFull);
+      if (stat.size === f.size) {
+        synced++;
+        continue; // already in sync — omit
+      }
+      status = "size_diff";
+    } catch {
+      status = "missing";
+    }
+
+    files.push({
+      path: outputsRel,
+      filename: f.filename,
+      file_id: f.file_id,
+      size: f.size,
+      status,
+    });
+  }
+
+  // Newest/largest-first is less useful than grouping; sort by path for a stable list.
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  return { ok: true, files, junk_skipped: junk, synced };
+}
+
+export interface OutputsPullResult {
+  pulled: string[];
+  errors: { file: string; message: string }[];
+}
+
+/**
+ * Download the given Drive file ids and write them to their reverse-mapped local
+ * outputs/ paths. The id→path mapping is recomputed from a fresh list_outputs so
+ * a stale client can't write a file to the wrong place.
+ */
+export async function pullOutputsFromDrive(
+  fileIds: string[],
+): Promise<OutputsPullResult> {
+  const cfg = await loadConfig();
+  if (!cfg) throw new Error("Drive ยังไม่ได้เชื่อม");
+
+  const review = await getOutputsPullReview();
+  if (!review.ok) throw new Error(review.error || "list_outputs failed");
+  const byId = new Map(review.files.map((f) => [f.file_id, f]));
+
+  const result: OutputsPullResult = { pulled: [], errors: [] };
+  for (const id of fileIds) {
+    const meta = byId.get(id);
+    if (!meta) {
+      result.errors.push({ file: id, message: "ไม่อยู่ในรายการ pull (อาจ sync แล้ว)" });
+      continue;
+    }
+    try {
+      const dl = await callScript<DownloadResponse>(cfg.url, {
+        action: "download",
+        file_id: id,
+      });
+      if (!dl.ok || !dl.content_b64) {
+        throw new Error(dl.error || "download failed");
+      }
+      const buf = Buffer.from(dl.content_b64, "base64");
+      const localFull = path.join(OUTPUTS_DIR, ...meta.path.split("/"));
+      await fs.mkdir(path.dirname(localFull), { recursive: true });
+      await fs.writeFile(localFull, buf);
+      result.pulled.push(`outputs/${meta.path}`);
+    } catch (e) {
+      result.errors.push({ file: `outputs/${meta.path}`, message: (e as Error).message });
+    }
+  }
+  return result;
+}
+
+/* ---------- Delete outputs (move to .trash, 1-level undo, trash on Drive) ---------- */
+
+const TRASH_DIR = path.join(OUTPUTS_DIR, ".trash");
+const TRASH_FILES_DIR = path.join(TRASH_DIR, "files");
+const TRASH_MANIFEST = path.join(TRASH_DIR, "manifest.json");
+
+interface TrashItem {
+  /** outputs/-relative path, e.g. "content/foo.png" */
+  path: string;
+  size: number;
+  drive_id: string | null;
+  /** Whether the Drive copy was successfully moved to Drive Trash. */
+  drive_trashed: boolean;
+  /** drive-state entries removed on delete, restored verbatim on undo. */
+  state_entries: Record<string, FileSyncEntry>;
+}
+
+interface TrashManifest {
+  deleted_at: string;
+  items: TrashItem[];
+}
+
+export interface TrashStatus {
+  count: number;
+  deleted_at: string | null;
+}
+
+export interface DeleteOutputsResult {
+  deleted: number;
+  drive_trashed: number;
+  drive_attempted: number;
+  /** True when the deployed Apps Script is too old to know `delete_file`. */
+  drive_unsupported: boolean;
+  errors: { file: string; message: string }[];
+}
+
+export interface UndoDeleteResult {
+  restored: number;
+  drive_restored: number;
+  errors: { file: string; message: string }[];
+}
+
+interface BulkTrashResponse {
+  ok: boolean;
+  trashed?: string[];
+  errors?: { id: string; message: string }[];
+  error?: string;
+}
+
+async function loadManifest(): Promise<TrashManifest | null> {
+  try {
+    return JSON.parse(await fs.readFile(TRASH_MANIFEST, "utf8")) as TrashManifest;
+  } catch {
+    return null;
+  }
+}
+
+/** Permanently remove everything in .trash — drops the single undo level. */
+async function purgeTrash(): Promise<void> {
+  await fs.rm(TRASH_DIR, { recursive: true, force: true });
+}
+
+export async function getTrashStatus(): Promise<TrashStatus> {
+  const m = await loadManifest();
+  return { count: m?.items.length ?? 0, deleted_at: m?.deleted_at ?? null };
+}
+
+/** A path is safe to delete only if it resolves strictly inside outputs/ and is
+ *  not the trash dir itself. */
+function isInsideOutputs(rel: string): boolean {
+  const full = path.resolve(OUTPUTS_DIR, rel);
+  return (
+    full.startsWith(OUTPUTS_DIR + path.sep) &&
+    full !== TRASH_DIR &&
+    !full.startsWith(TRASH_DIR + path.sep)
+  );
+}
+
+/**
+ * Move the given outputs/-relative files to outputs/.trash (one undo level) and
+ * trash their Drive copies (setTrashed — recoverable from Drive Trash for ~30d).
+ * A new delete first purges the previous trash, so only the most recent batch is
+ * recoverable via undoDelete(). `stampIso` comes from the route (no clock in lib).
+ */
+export async function deleteOutputs(
+  relPaths: string[],
+  stampIso: string,
+): Promise<DeleteOutputsResult> {
+  const result: DeleteOutputsResult = {
+    deleted: 0,
+    drive_trashed: 0,
+    drive_attempted: 0,
+    drive_unsupported: false,
+    errors: [],
+  };
+  const clean = relPaths
+    .map((p) => p.replace(/^outputs\//, "").replace(/^\/+/, ""))
+    .filter((p) => p && isInsideOutputs(p) && !p.startsWith(".trash"));
+  if (clean.length === 0) return result;
+
+  // 1-level undo: drop whatever was trashed before this batch.
+  await purgeTrash();
+  await fs.mkdir(TRASH_FILES_DIR, { recursive: true });
+
+  const state = await loadState();
+  const cfg = await loadConfig();
+
+  const items: TrashItem[] = [];
+  const driveIds: string[] = [];
+
+  for (const rel of clean) {
+    const src = path.join(OUTPUTS_DIR, ...rel.split("/"));
+    try {
+      const stat = await fs.stat(src);
+      const dest = path.join(TRASH_FILES_DIR, ...rel.split("/"));
+      await fs.mkdir(path.dirname(dest), { recursive: true });
+      await fs.rename(src, dest);
+
+      // Pull matching drive-state entries (exact + "#tag" multi-dest variants).
+      const prefix = `outputs/${rel}`;
+      const entries: Record<string, FileSyncEntry> = {};
+      let driveId: string | null = null;
+      for (const key of Object.keys(state.files)) {
+        if (key === prefix || key.startsWith(`${prefix}#`)) {
+          entries[key] = state.files[key];
+          if (!driveId) driveId = state.files[key].drive_id || null;
+          delete state.files[key];
+        }
+      }
+      if (driveId) driveIds.push(driveId);
+
+      items.push({
+        path: rel,
+        size: stat.size,
+        drive_id: driveId,
+        drive_trashed: false,
+        state_entries: entries,
+      });
+      result.deleted++;
+    } catch (e) {
+      result.errors.push({ file: `outputs/${rel}`, message: (e as Error).message });
+    }
+  }
+
+  // Trash Drive copies (best effort — local move already succeeded).
+  if (cfg && driveIds.length > 0) {
+    result.drive_attempted = driveIds.length;
+    try {
+      const r = await callScript<BulkTrashResponse>(cfg.url, {
+        action: "delete_file",
+        file_ids: driveIds,
+      });
+      if (r.ok) {
+        const done = new Set(r.trashed || []);
+        for (const it of items) {
+          if (it.drive_id && done.has(it.drive_id)) {
+            it.drive_trashed = true;
+            result.drive_trashed++;
+          }
+        }
+      } else if (/unknown action/i.test(r.error || "")) {
+        result.drive_unsupported = true;
+      } else {
+        result.errors.push({ file: "Drive", message: r.error || "delete_file ล้มเหลว" });
+      }
+    } catch (e) {
+      result.errors.push({ file: "Drive", message: (e as Error).message });
+    }
+  }
+
+  await saveState(state);
+  await fs.mkdir(TRASH_DIR, { recursive: true });
+  const manifest: TrashManifest = { deleted_at: stampIso, items };
+  await fs.writeFile(TRASH_MANIFEST, JSON.stringify(manifest, null, 2), "utf8");
+  return result;
+}
+
+/** Restore the last deleted batch from outputs/.trash and un-trash Drive copies. */
+export async function undoDelete(): Promise<UndoDeleteResult> {
+  const result: UndoDeleteResult = { restored: 0, drive_restored: 0, errors: [] };
+  const manifest = await loadManifest();
+  if (!manifest || manifest.items.length === 0) {
+    throw new Error("ไม่มีรายการให้กู้คืน");
+  }
+
+  const state = await loadState();
+  const cfg = await loadConfig();
+  const untrashIds: string[] = [];
+
+  for (const it of manifest.items) {
+    const trashed = path.join(TRASH_FILES_DIR, ...it.path.split("/"));
+    const dest = path.join(OUTPUTS_DIR, ...it.path.split("/"));
+    try {
+      await fs.mkdir(path.dirname(dest), { recursive: true });
+      await fs.rename(trashed, dest);
+      for (const [key, entry] of Object.entries(it.state_entries)) {
+        state.files[key] = entry;
+      }
+      if (it.drive_trashed && it.drive_id) untrashIds.push(it.drive_id);
+      result.restored++;
+    } catch (e) {
+      result.errors.push({ file: `outputs/${it.path}`, message: (e as Error).message });
+    }
+  }
+
+  // Un-trash Drive copies. If this fails the files simply stay in Drive Trash,
+  // recoverable from the Drive UI for ~30 days — so we swallow the error.
+  if (cfg && untrashIds.length > 0) {
+    try {
+      const r = await callScript<BulkTrashResponse>(cfg.url, {
+        action: "untrash_file",
+        file_ids: untrashIds,
+      });
+      if (r.ok) result.drive_restored = (r.trashed || []).length;
+    } catch {
+      /* leave in Drive Trash */
+    }
+  }
+
+  await saveState(state);
+  await purgeTrash();
+  return result;
+}
+
 /** Extract YYYY-MM from a filename (e.g. "expense-2026-05-15-internet.pdf" → "2026-05"). */
 function extractMonth(filename: string): string | null {
   const m = filename.match(/(\d{4})-(0[1-9]|1[0-2])(?:[-_.\d]|$)/);
@@ -1507,7 +1943,17 @@ export function extractFolderId(url: string): string | null {
 export function buildAppsScriptTemplate(targetFolderId?: string): string {
   const baked = (targetFolderId ?? "").trim();
   return `/**
- * Virtual AI Company — Drive Sync receiver  (v12)
+ * Virtual AI Company — Drive Sync receiver  (v14)
+ *
+ * What's new in v14:
+ *   - 🗑 action "delete_file" / "untrash_file": ลบไฟล์ใน outputs จากหน้า Files
+ *     (ติ๊กหลายไฟล์ลบทีเดียว). ใช้ setTrashed() → เข้า Drive Trash กู้ได้ ~30 วัน
+ *     ไม่ลบถาวร. untrash_file = ปุ่ม "↩ กู้คืน" 1 ระดับบน dashboard
+ *
+ * v13:
+ *   - 📥 action "list_outputs": ไล่ไฟล์จริง (non-Sheets) ทุกโฟลเดอร์ใต้ root ส่ง
+ *     กลับให้ dashboard reverse-map เป็น outputs/ แล้ว pull ของที่เซิร์ฟยังไม่มี
+ *     (ปุ่ม "ดึง outputs จาก Drive")
  *
  * What's new in v12:
  *   - 🔗 วิดีโอ: ดึง permalink_url จริงจาก FB หลังอัพ แทน URL เดา /<page>/videos/<id>
@@ -1546,7 +1992,7 @@ export function buildAppsScriptTemplate(targetFolderId?: string): string {
  *      (URL เดิม /exec ใช้ต่อได้ ไม่ต้องเปลี่ยน)
  */
 
-const SCRIPT_VERSION = "12";
+const SCRIPT_VERSION = "14";
 const MAX_ATTEMPTS = 3;
 const BACKUP_FOLDER_NAME = "⚙ Setup Backup";
 const FB_TRIGGER_FN = "runFbScheduler";
@@ -1599,6 +2045,24 @@ function doPost(e) {
       return json_({ ok: true, id: file.getId(), url: file.getUrl() });
     }
 
+    if (body.action === "delete_file" || body.action === "untrash_file") {
+      // Soft delete: setTrashed moves to Drive Trash (recoverable ~30 days),
+      // never a hard destroy. untrash_file is the undo path.
+      var ids = body.file_ids || [];
+      var trash = body.action === "delete_file";
+      var done = [];
+      var errs = [];
+      for (var di = 0; di < ids.length; di++) {
+        try {
+          DriveApp.getFileById(ids[di]).setTrashed(trash);
+          done.push(ids[di]);
+        } catch (e) {
+          errs.push({ id: ids[di], message: String(e) });
+        }
+      }
+      return json_({ ok: true, trashed: done, errors: errs });
+    }
+
     if (body.action === "list_backup") {
       const root = getRoot_();
       const folders = root.getFoldersByName(BACKUP_FOLDER_NAME);
@@ -1632,6 +2096,18 @@ function doPost(e) {
         size: file.getSize(),
         content_b64: Utilities.base64Encode(blob.getBytes()),
       });
+    }
+
+    if (body.action === "list_outputs") {
+      // Recursively walk every category folder under root and return the raw
+      // (non-Sheets) files so the dashboard can reverse-map Drive paths back to
+      // local outputs/ and pull what the server is missing. Skips the backup
+      // folder and any Google-native docs (Sheets workbooks live in their own
+      // folders and are handled by list_workbooks).
+      const root = getRoot_();
+      const out = [];
+      collectOutputs_(root, "", out, 6);
+      return json_({ ok: true, files: out, root_url: root.getUrl() });
     }
 
     /* ============================================================
@@ -1833,12 +2309,12 @@ function doGet() {
   return json_({
     ok: true,
     script_version: SCRIPT_VERSION,
-    hint: "POST {action:'ping'|'upload'|'list_backup'|'download'|'init_sheet'|'list_workbooks'|'read_sheet'|'write_sheet'|'fb_post_now'|'fb_retry_post'|...}",
+    hint: "POST {action:'ping'|'upload'|'delete_file'|'untrash_file'|'list_backup'|'download'|'list_outputs'|'init_sheet'|'list_workbooks'|'read_sheet'|'write_sheet'|'fb_post_now'|'fb_retry_post'|...}",
   });
 }
 
 /**
- * 👉 รันฟังก์ชันนี้ครั้งเดียวจาก script editor หลัง paste โค้ด v5:
+ * 👉 รันฟังก์ชันนี้ครั้งเดียวจาก script editor หลัง paste โค้ดใหม่:
  *    1. เมนูบนสุด → Select function → "authorize"
  *    2. กด ▶ Run
  *    3. Google จะขอสิทธิ์ Sheets (เพิ่มจาก Drive เดิม) → Allow
@@ -1972,6 +2448,32 @@ function collectSheets_(folder, prefix, out, depthLeft) {
     if (sub.getName() === BACKUP_FOLDER_NAME) continue;
     const nextPrefix = prefix ? (prefix + "/" + sub.getName()) : sub.getName();
     collectSheets_(sub, nextPrefix, out, depthLeft - 1);
+  }
+}
+
+function collectOutputs_(folder, prefix, out, depthLeft) {
+  if (depthLeft < 0) return;
+  const fit = folder.getFiles();
+  while (fit.hasNext()) {
+    const f = fit.next();
+    // Skip Google-native files (Sheets/Docs/Slides) — only real blobs pull back.
+    const mime = f.getMimeType();
+    if (mime.indexOf("application/vnd.google-apps") === 0) continue;
+    out.push({
+      folder_path: prefix,
+      filename: f.getName(),
+      file_id: f.getId(),
+      size: f.getSize(),
+      mime: mime,
+      updated_at: f.getLastUpdated().toISOString(),
+    });
+  }
+  const sit = folder.getFolders();
+  while (sit.hasNext()) {
+    const sub = sit.next();
+    if (sub.getName() === BACKUP_FOLDER_NAME) continue;
+    const nextPrefix = prefix ? (prefix + "/" + sub.getName()) : sub.getName();
+    collectOutputs_(sub, nextPrefix, out, depthLeft - 1);
   }
 }
 

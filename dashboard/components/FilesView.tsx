@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import SetupDriveModal from "./SetupDriveModal";
 import SheetsPanel from "./SheetsPanel";
+import PullOutputsPanel from "./PullOutputsPanel";
 
 interface OutputFile {
   path: string;
@@ -13,6 +14,12 @@ interface OutputFile {
   category: string;
   synced?: boolean;
   web_link?: string;
+  junk?: boolean;
+}
+
+interface TrashStatus {
+  count: number;
+  deleted_at: string | null;
 }
 
 interface CategoryMeta {
@@ -93,6 +100,12 @@ export default function FilesView() {
     null,
   );
   const [snapshotBusy, setSnapshotBusy] = useState(false);
+  /** outputs/-relative paths ticked for deletion */
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [deleting, setDeleting] = useState(false);
+  const [trash, setTrash] = useState<TrashStatus | null>(null);
+  const [deleteToast, setDeleteToast] = useState<string | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
 
   const loadSnapshots = useCallback(async () => {
     try {
@@ -107,19 +120,29 @@ export default function FilesView() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [filesRes, driveRes, backupRes] = await Promise.all([
+      const [filesRes, driveRes, backupRes, trashRes] = await Promise.all([
         fetch(`/api/outputs/list?includeUploads=${includeUploads ? 1 : 0}`),
         fetch("/api/drive/status"),
         fetch("/api/setup/backup"),
+        fetch("/api/outputs/delete"),
       ]);
       const fd = (await filesRes.json()) as {
         files: OutputFile[];
         categories: CategoryMeta[];
       };
-      setFiles(fd.files || []);
+      const nextFiles = fd.files || [];
+      setFiles(nextFiles);
       setCats(fd.categories || []);
       setDrive((await driveRes.json()) as DriveStatus);
       setBackupStatus((await backupRes.json()) as BackupStatus);
+      setTrash((await trashRes.json()) as TrashStatus);
+      // Drop ticks for files that no longer exist (deleted, filtered out).
+      const present = new Set(nextFiles.map((f) => f.path));
+      setSelected((prev) => {
+        const next = new Set<string>();
+        for (const p of prev) if (present.has(p)) next.add(p);
+        return next.size === prev.size ? prev : next;
+      });
       await loadSnapshots();
     } finally {
       setLoading(false);
@@ -272,6 +295,105 @@ export default function FilesView() {
     }
   }
 
+  /* ---------- selection + delete ---------- */
+
+  const toggleSelect = useCallback((p: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(p)) next.delete(p);
+      else next.add(p);
+      return next;
+    });
+  }, []);
+
+  /** Add every path matching `pred` to the selection (quick-select chips). */
+  const selectWhere = useCallback(
+    (pred: (f: OutputFile) => boolean) => {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const f of files) if (pred(f)) next.add(f.path);
+        return next;
+      });
+    },
+    [files],
+  );
+
+  /** Bulk add/remove a list of paths (category select-all checkbox). */
+  const setMany = useCallback((paths: string[], on: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const p of paths) {
+        if (on) next.add(p);
+        else next.delete(p);
+      }
+      return next;
+    });
+  }, []);
+
+  const clearSelection = useCallback(() => {
+    setSelected(new Set());
+    setConfirmingDelete(false);
+  }, []);
+
+  async function doDelete() {
+    if (selected.size === 0) return;
+    if (!confirmingDelete) {
+      setConfirmingDelete(true);
+      setTimeout(() => setConfirmingDelete(false), 4000);
+      return;
+    }
+    setConfirmingDelete(false);
+    setDeleting(true);
+    setDeleteToast(null);
+    try {
+      const res = await fetch("/api/outputs/delete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "delete", paths: [...selected] }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setDeleteToast(data.error || `ลบล้มเหลว (HTTP ${res.status})`);
+      } else {
+        const driveNote = data.drive_unsupported
+          ? " · Drive ยังลบไม่ได้ (ต้อง redeploy Apps Script)"
+          : data.drive_trashed > 0
+            ? ` · Drive ${data.drive_trashed} ไฟล์`
+            : "";
+        setDeleteToast(`✓ ลบ ${data.deleted} ไฟล์ไปถังขยะ${driveNote}`);
+        setSelected(new Set());
+      }
+      await load();
+    } catch (e) {
+      setDeleteToast((e as Error).message);
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  async function doUndo() {
+    setDeleting(true);
+    setDeleteToast(null);
+    try {
+      const res = await fetch("/api/outputs/delete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "undo" }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setDeleteToast(data.error || "กู้คืนล้มเหลว");
+      } else {
+        setDeleteToast(`✓ กู้คืน ${data.restored} ไฟล์`);
+      }
+      await load();
+    } catch (e) {
+      setDeleteToast((e as Error).message);
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function syncNow() {
     setSyncing(true);
     setSyncResult(null);
@@ -323,6 +445,20 @@ export default function FilesView() {
       })
       .filter((g) => g.files.length > 0);
   }, [cats, files]);
+
+  const junkCount = useMemo(() => files.filter((f) => f.junk).length, [files]);
+  const unsyncedCount = useMemo(
+    () => files.filter((f) => !f.synced).length,
+    [files],
+  );
+  const selectedBytes = useMemo(
+    () =>
+      files
+        .filter((f) => selected.has(f.path))
+        .reduce((s, f) => s + f.size, 0),
+    [files, selected],
+  );
+  const OLD_MS = 30 * 24 * 60 * 60 * 1000;
 
   if (loading) {
     return (
@@ -398,6 +534,8 @@ export default function FilesView() {
         }}
       />
 
+      <PullOutputsPanel />
+
       <SheetsPanel />
 
       <SetupDriveModal
@@ -407,6 +545,97 @@ export default function FilesView() {
           load();
         }}
       />
+
+      {/* Quick-select + delete toolbar */}
+      {files.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 border-b border-border bg-surface/40 px-5 py-2 text-[11px]">
+          <span className="text-ink-dim">เลือกด่วน:</span>
+          <button
+            onClick={() => selectWhere((f) => !!f.junk)}
+            disabled={junkCount === 0}
+            title="ไฟล์ขยะ: นามสกุลที่ไม่เก็บ (.log/.txt/.sh/.mjs…), ขึ้นต้น _ , -old, chk-*"
+            className="rounded-full border border-border bg-surface px-2 py-0.5 text-ink-dim hover:border-danger hover:text-danger disabled:opacity-40"
+          >
+            🧹 ขยะ ({junkCount})
+          </button>
+          <button
+            onClick={() => selectWhere((f) => !f.synced)}
+            disabled={unsyncedCount === 0}
+            className="rounded-full border border-border bg-surface px-2 py-0.5 text-ink-dim hover:border-accent hover:text-ink disabled:opacity-40"
+          >
+            ยังไม่ sync ({unsyncedCount})
+          </button>
+          <button
+            onClick={() => selectWhere((f) => Date.now() - f.mtime > OLD_MS)}
+            className="rounded-full border border-border bg-surface px-2 py-0.5 text-ink-dim hover:border-accent hover:text-ink"
+          >
+            เก่ากว่า 30 วัน
+          </button>
+
+          {deleteToast && (
+            <span
+              className={[
+                "rounded px-2 py-0.5",
+                deleteToast.startsWith("✓")
+                  ? "bg-ok/15 text-ok"
+                  : "bg-danger/15 text-danger",
+              ].join(" ")}
+            >
+              {deleteToast}
+            </span>
+          )}
+
+          <div className="flex-1" />
+
+          {selected.size > 0 && (
+            <>
+              <span className="font-medium text-ink">
+                เลือก {selected.size} · {prettyBytes(selectedBytes)}
+              </span>
+              <button
+                onClick={clearSelection}
+                className="rounded-md border border-border bg-surface px-2 py-0.5 text-ink-dim hover:text-ink"
+              >
+                ยกเลิก
+              </button>
+              <button
+                onClick={doDelete}
+                disabled={deleting}
+                className={[
+                  "rounded-md border px-2.5 py-0.5 font-medium disabled:opacity-50",
+                  confirmingDelete
+                    ? "border-danger bg-danger/15 text-danger"
+                    : "border-danger/50 bg-danger/10 text-danger hover:bg-danger/20",
+                ].join(" ")}
+              >
+                {deleting
+                  ? "กำลังลบ…"
+                  : confirmingDelete
+                    ? "ยืนยันลบไปถังขยะ?"
+                    : `🗑 ลบ ${selected.size} ไฟล์`}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Undo banner — 1-level restore of the last deleted batch */}
+      {trash && trash.count > 0 && (
+        <div className="flex items-center gap-2 border-b border-amber-500/40 bg-amber-500/10 px-5 py-1.5 text-[11px]">
+          <span className="text-amber-300">🗑</span>
+          <span className="text-amber-200">
+            ลบ {trash.count} ไฟล์ไปถังขยะแล้ว — กู้คืนได้ 1 ระดับ (ลบรอบใหม่จะล้างของเก่าถาวร)
+          </span>
+          <div className="flex-1" />
+          <button
+            onClick={doUndo}
+            disabled={deleting}
+            className="rounded-md border border-amber-500/50 bg-amber-500/15 px-2.5 py-0.5 font-medium text-amber-200 hover:bg-amber-500/25 disabled:opacity-50"
+          >
+            ↩ กู้คืน
+          </button>
+        </div>
+      )}
 
       <div className="flex-1 overflow-y-auto p-4">
         {grouped.length === 0 ? (
@@ -420,6 +649,9 @@ export default function FilesView() {
                 files={files}
                 collapsed={collapsed.has(meta.id)}
                 onToggle={() => toggle(meta.id)}
+                selected={selected}
+                onToggleSelect={toggleSelect}
+                onSetMany={setMany}
               />
             ))}
           </div>
@@ -551,6 +783,13 @@ function DrivePanel({
               className="rounded-lg bg-accent-soft px-3 py-1.5 text-xs font-medium text-white hover:bg-accent disabled:opacity-40"
             >
               {syncing ? "กำลัง sync…" : "☁ Sync now"}
+            </button>
+            <button
+              onClick={onConnect}
+              title="ดู/ก๊อปสคริปต์ Apps Script ตัวล่าสุด แล้ว redeploy เป็น New version — ไม่ต้องยกเลิกการเชื่อม"
+              className="rounded-md border border-border bg-surface px-2 py-1.5 text-[11px] text-ink-dim hover:border-accent hover:text-ink"
+            >
+              🔁 อัปเดตสคริปต์
             </button>
             <button
               onClick={onDisconnect}
@@ -931,36 +1170,68 @@ function CategorySection({
   files,
   collapsed,
   onToggle,
+  selected,
+  onToggleSelect,
+  onSetMany,
 }: {
   meta: CategoryMeta;
   files: OutputFile[];
   collapsed: boolean;
   onToggle: () => void;
+  selected: Set<string>;
+  onToggleSelect: (p: string) => void;
+  onSetMany: (paths: string[], on: boolean) => void;
 }) {
+  const paths = files.map((f) => f.path);
+  const selectedHere = paths.filter((p) => selected.has(p)).length;
+  const allSelected = selectedHere === files.length && files.length > 0;
   return (
     <section className="rounded-xl border border-border bg-surface/40">
-      <button
-        onClick={onToggle}
-        className="flex w-full items-center justify-between gap-2 border-b border-border px-3 py-2 text-left hover:bg-surface-2/40"
-      >
-        <div className="flex items-center gap-2">
-          <span className="text-base">{meta.icon}</span>
-          <div>
-            <p className="text-sm font-semibold text-ink">{meta.label}</p>
-            <p className="text-[10px] text-ink-dim">{meta.description}</p>
+      <div className="flex items-center gap-2 border-b border-border px-3 py-2 hover:bg-surface-2/40">
+        <input
+          type="checkbox"
+          checked={allSelected}
+          ref={(el) => {
+            if (el) el.indeterminate = selectedHere > 0 && !allSelected;
+          }}
+          onChange={(e) => onSetMany(paths, e.target.checked)}
+          onClick={(e) => e.stopPropagation()}
+          title="เลือก/ยกเลิกทั้งหมวด"
+          className="h-3.5 w-3.5 shrink-0 accent-danger"
+        />
+        <button
+          onClick={onToggle}
+          className="flex flex-1 items-center justify-between gap-2 text-left"
+        >
+          <div className="flex items-center gap-2">
+            <span className="text-base">{meta.icon}</span>
+            <div>
+              <p className="text-sm font-semibold text-ink">{meta.label}</p>
+              <p className="text-[10px] text-ink-dim">{meta.description}</p>
+            </div>
           </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="rounded-full bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-ink-dim">
-            {files.length}
-          </span>
-          <span className="text-ink-dim">{collapsed ? "›" : "⌄"}</span>
-        </div>
-      </button>
+          <div className="flex items-center gap-2">
+            {selectedHere > 0 && (
+              <span className="rounded-full bg-danger/15 px-2 py-0.5 text-[10px] font-medium text-danger">
+                เลือก {selectedHere}
+              </span>
+            )}
+            <span className="rounded-full bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-ink-dim">
+              {files.length}
+            </span>
+            <span className="text-ink-dim">{collapsed ? "›" : "⌄"}</span>
+          </div>
+        </button>
+      </div>
       {!collapsed && (
         <ul className="divide-y divide-border/50">
           {files.map((f) => (
-            <FileRow key={f.path} file={f} />
+            <FileRow
+              key={f.path}
+              file={f}
+              checked={selected.has(f.path)}
+              onToggleSelect={() => onToggleSelect(f.path)}
+            />
           ))}
         </ul>
       )}
@@ -968,13 +1239,42 @@ function CategorySection({
   );
 }
 
-function FileRow({ file }: { file: OutputFile }) {
+function FileRow({
+  file,
+  checked,
+  onToggleSelect,
+}: {
+  file: OutputFile;
+  checked: boolean;
+  onToggleSelect: () => void;
+}) {
   const url = `/api/outputs/file/${file.path.split("/").map(encodeURIComponent).join("/")}`;
   return (
-    <li className="flex items-center gap-3 px-3 py-2 text-xs hover:bg-surface-2/30">
+    <li
+      className={[
+        "flex items-center gap-3 px-3 py-2 text-xs hover:bg-surface-2/30",
+        checked ? "bg-danger/5" : "",
+      ].join(" ")}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={onToggleSelect}
+        className="h-3.5 w-3.5 shrink-0 accent-danger"
+      />
       <span className="text-sm">{pickIcon(file.path, file.mimeType)}</span>
       <div className="min-w-0 flex-1">
-        <p className="truncate font-mono text-ink">{file.name}</p>
+        <p className="flex items-center gap-1.5 truncate font-mono text-ink">
+          {file.name}
+          {file.junk && (
+            <span
+              title="ไฟล์ขยะ: นามสกุล/ชื่อบ่งชี้ว่าเป็นไฟล์ชั่วคราว"
+              className="shrink-0 rounded bg-danger/15 px-1 py-px text-[9px] font-sans font-medium text-danger"
+            >
+              ขยะ
+            </span>
+          )}
+        </p>
         <p className="text-[10.5px] text-ink-dim">
           {prettyBytes(file.size)} · {fmtDate(file.mtime)}
         </p>

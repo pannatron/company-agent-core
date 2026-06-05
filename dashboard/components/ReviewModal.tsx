@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { diffLines, diffWordsWithSpace } from "diff";
 
 /* ---------- shared types (mirror lib/driveSync.ts) ---------- */
@@ -52,6 +52,21 @@ interface ReviewPreview {
   cloud_target?: CloudTarget;
   cloud_url?: string;
   cloud_url_label?: string;
+}
+
+/* ---------- search filter (filename / extension) ---------- */
+
+/**
+ * Match a file against a lowercased query. Hits on substring of the path
+ * (so a category folder name works too) or an extension match — "csv" and
+ * ".csv" both match `*.csv`.
+ */
+function matchesQuery(name: string, path: string | null, q: string): boolean {
+  if (!q) return true;
+  const hay = (path ?? name).toLowerCase();
+  if (hay.includes(q)) return true;
+  const ext = q.startsWith(".") ? q : "." + q;
+  return name.toLowerCase().endsWith(ext);
 }
 
 /* ---------- ReviewBanner: sticky bar shown globally when pending ---------- */
@@ -107,6 +122,21 @@ export function ReviewModal({
   );
   const outputs = review.outputs ?? [];
 
+  /** Filename / extension filter applied to both lists. */
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const filteredChangedFiles = useMemo(
+    () =>
+      q
+        ? changedFiles.filter((f) => matchesQuery(f.name, null, q))
+        : changedFiles,
+    [changedFiles, q],
+  );
+  const filteredOutputs = useMemo(
+    () => (q ? outputs.filter((o) => matchesQuery(o.name, o.path, q)) : outputs),
+    [outputs, q],
+  );
+
   /** Selected names from data/ side (filename, e.g. "employees.csv") */
   const [selected, setSelected] = useState<Set<string>>(new Set());
   /** Selected outputs/-relative paths (e.g. "content/launch.png") */
@@ -128,31 +158,46 @@ export function ReviewModal({
       ? outputs.find((o) => o.path === active.path)
       : undefined;
 
-  // Default: every changed file is checked. Reset whenever the modal opens or
-  // the file list changes.
+  // Seed selection + clear search/errors ONCE per open-session. The parent
+  // polls /api/data/review every 6s, so `review` (hence changedFiles/outputs)
+  // gets a fresh ref on every tick — re-running this each time would wipe the
+  // user's search query and re-check everything they unchecked. The ref guards
+  // against that: seed on open, reset on close.
+  const seededRef = useRef(false);
   useEffect(() => {
-    if (open) {
-      setSelected(new Set(changedFiles.map((f) => f.name)));
-      setSelectedOutputs(new Set(outputs.map((o) => o.path)));
-      setActive((curr) => {
-        if (
-          curr?.kind === "file" &&
-          changedFiles.some((f) => f.name === curr.name)
-        )
-          return curr;
-        if (
-          curr?.kind === "output" &&
-          outputs.some((o) => o.path === curr.path)
-        )
-          return curr;
-        if (changedFiles[0])
-          return { kind: "file", name: changedFiles[0].name };
-        if (outputs[0]) return { kind: "output", path: outputs[0].path };
-        return null;
-      });
-      setErrors([]);
-      setToast(null);
+    if (!open) {
+      seededRef.current = false;
+      return;
     }
+    if (seededRef.current) return;
+    seededRef.current = true;
+    setSelected(new Set(changedFiles.map((f) => f.name)));
+    setSelectedOutputs(new Set(outputs.map((o) => o.path)));
+    setActive(
+      changedFiles[0]
+        ? { kind: "file", name: changedFiles[0].name }
+        : outputs[0]
+          ? { kind: "output", path: outputs[0].path }
+          : null,
+    );
+    setErrors([]);
+    setToast(null);
+    setQuery("");
+  }, [open, changedFiles, outputs]);
+
+  // Keep the active preview target valid as polls add/remove files — without
+  // touching selection or the search query.
+  useEffect(() => {
+    if (!open) return;
+    setActive((curr) => {
+      if (curr?.kind === "file" && changedFiles.some((f) => f.name === curr.name))
+        return curr;
+      if (curr?.kind === "output" && outputs.some((o) => o.path === curr.path))
+        return curr;
+      if (changedFiles[0]) return { kind: "file", name: changedFiles[0].name };
+      if (outputs[0]) return { kind: "output", path: outputs[0].path };
+      return null;
+    });
   }, [open, changedFiles, outputs]);
 
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -213,21 +258,35 @@ export function ReviewModal({
     });
   }, []);
 
+  // Select-all toggles operate on the *visible* (filtered) rows: if every
+  // visible row is already checked, uncheck them; otherwise add them all.
   const toggleAllFiles = useCallback(() => {
-    setSelected((prev) =>
-      prev.size === changedFiles.length
-        ? new Set()
-        : new Set(changedFiles.map((f) => f.name)),
-    );
-  }, [changedFiles]);
+    setSelected((prev) => {
+      const allOn =
+        filteredChangedFiles.length > 0 &&
+        filteredChangedFiles.every((f) => prev.has(f.name));
+      const next = new Set(prev);
+      for (const f of filteredChangedFiles) {
+        if (allOn) next.delete(f.name);
+        else next.add(f.name);
+      }
+      return next;
+    });
+  }, [filteredChangedFiles]);
 
   const toggleAllOutputs = useCallback(() => {
-    setSelectedOutputs((prev) =>
-      prev.size === outputs.length
-        ? new Set()
-        : new Set(outputs.map((o) => o.path)),
-    );
-  }, [outputs]);
+    setSelectedOutputs((prev) => {
+      const allOn =
+        filteredOutputs.length > 0 &&
+        filteredOutputs.every((o) => prev.has(o.path));
+      const next = new Set(prev);
+      for (const o of filteredOutputs) {
+        if (allOn) next.delete(o.path);
+        else next.add(o.path);
+      }
+      return next;
+    });
+  }, [filteredOutputs]);
 
   const totalSelected = selected.size + selectedOutputs.size;
   const totalChanged = changedFiles.length + outputs.length;
@@ -359,6 +418,30 @@ export function ReviewModal({
         <div className="grid min-h-0 flex-1 grid-cols-[280px_1fr]">
           {/* File list */}
           <aside className="flex min-h-0 flex-col border-r border-border bg-surface/30">
+            {/* Search: filter both lists by filename or extension */}
+            <div className="border-b border-border p-2">
+              <div className="relative">
+                <span className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-[11px] text-ink-dim/70">
+                  🔍
+                </span>
+                <input
+                  type="text"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="กรองชื่อไฟล์ / นามสกุล (เช่น csv, .png)"
+                  className="w-full rounded-md border border-border bg-bg py-1 pl-7 pr-7 text-[11.5px] text-ink placeholder:text-ink-dim/60 focus:border-accent focus:outline-none"
+                />
+                {query && (
+                  <button
+                    onClick={() => setQuery("")}
+                    aria-label="ล้างการค้นหา"
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-ink-dim hover:bg-surface-2 hover:text-ink"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+            </div>
             <div className="flex-1 overflow-y-auto">
               {/* Section 1: data/ files */}
               <div className="border-b border-border">
@@ -367,26 +450,38 @@ export function ReviewModal({
                     <input
                       type="checkbox"
                       checked={
-                        changedFiles.length > 0 &&
-                        selected.size === changedFiles.length
+                        filteredChangedFiles.length > 0 &&
+                        filteredChangedFiles.every((f) => selected.has(f.name))
                       }
                       onChange={toggleAllFiles}
-                      disabled={changedFiles.length === 0}
+                      disabled={filteredChangedFiles.length === 0}
                       className="h-3 w-3 accent-accent"
                     />
-                    <span>📋 data/ ({changedFiles.length})</span>
+                    <span>
+                      📋 data/ ({filteredChangedFiles.length}
+                      {q && filteredChangedFiles.length !== changedFiles.length
+                        ? `/${changedFiles.length}`
+                        : ""}
+                      )
+                    </span>
                   </label>
                   <span className="text-ink-dim/70">
-                    {selected.size}/{changedFiles.length}
+                    {
+                      filteredChangedFiles.filter((f) => selected.has(f.name))
+                        .length
+                    }
+                    /{filteredChangedFiles.length}
                   </span>
                 </div>
                 <div className="p-1.5">
-                  {changedFiles.length === 0 ? (
+                  {filteredChangedFiles.length === 0 ? (
                     <p className="px-2 py-2 text-[10.5px] text-ink-dim/70">
-                      ไม่มีไฟล์ data ที่เปลี่ยน
+                      {q && changedFiles.length > 0
+                        ? `ไม่พบไฟล์ที่ตรงกับ "${query.trim()}"`
+                        : "ไม่มีไฟล์ data ที่เปลี่ยน"}
                     </p>
                   ) : (
-                    changedFiles.map((f) => (
+                    filteredChangedFiles.map((f) => (
                       <FileRow
                         key={f.name}
                         file={f}
@@ -410,26 +505,38 @@ export function ReviewModal({
                     <input
                       type="checkbox"
                       checked={
-                        outputs.length > 0 &&
-                        selectedOutputs.size === outputs.length
+                        filteredOutputs.length > 0 &&
+                        filteredOutputs.every((o) => selectedOutputs.has(o.path))
                       }
                       onChange={toggleAllOutputs}
-                      disabled={outputs.length === 0}
+                      disabled={filteredOutputs.length === 0}
                       className="h-3 w-3 accent-accent"
                     />
-                    <span>🖼 outputs/ ({outputs.length})</span>
+                    <span>
+                      🖼 outputs/ ({filteredOutputs.length}
+                      {q && filteredOutputs.length !== outputs.length
+                        ? `/${outputs.length}`
+                        : ""}
+                      )
+                    </span>
                   </label>
                   <span className="text-ink-dim/70">
-                    {selectedOutputs.size}/{outputs.length}
+                    {
+                      filteredOutputs.filter((o) => selectedOutputs.has(o.path))
+                        .length
+                    }
+                    /{filteredOutputs.length}
                   </span>
                 </div>
                 <div className="p-1.5">
-                  {outputs.length === 0 ? (
+                  {filteredOutputs.length === 0 ? (
                     <p className="px-2 py-2 text-[10.5px] text-ink-dim/70">
-                      ไม่มี output ใหม่รอ upload
+                      {q && outputs.length > 0
+                        ? `ไม่พบ output ที่ตรงกับ "${query.trim()}"`
+                        : "ไม่มี output ใหม่รอ upload"}
                     </p>
                   ) : (
-                    outputs.map((o) => (
+                    filteredOutputs.map((o) => (
                       <OutputRow
                         key={o.path}
                         output={o}
