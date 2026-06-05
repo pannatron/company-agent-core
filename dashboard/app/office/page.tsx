@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { CompanyProfile } from "@/lib/companyProfile";
 import { useJobStream, type ClientJob } from "@/lib/useJobStream";
@@ -16,7 +16,44 @@ export default function OfficePage() {
   const [loading, setLoading] = useState(true);
   const [hasLogo, setHasLogo] = useState(false);
 
-  const { active, recent, connected } = useJobStream();
+  // Side toasts — pop in when any agent finishes, so the user notices even if
+  // that desk's over-head bubble is off-screen (camera follows the player).
+  const [toasts, setToasts] = useState<JobToast[]>([]);
+  const toastTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const handleFinish = useCallback((job: ClientJob) => {
+    const t: JobToast = {
+      id: job.id,
+      slug: job.employeeSlug as EmployeeSlug,
+      name: job.employeeName,
+      accent: job.employeeAccent,
+      status: job.status,
+    };
+    setToasts((cur) => [...cur.filter((x) => x.id !== t.id), t].slice(-4));
+    const prev = toastTimers.current.get(t.id);
+    if (prev) clearTimeout(prev);
+    toastTimers.current.set(
+      t.id,
+      setTimeout(() => {
+        setToasts((cur) => cur.filter((x) => x.id !== t.id));
+        toastTimers.current.delete(t.id);
+      }, 5000),
+    );
+  }, []);
+  useEffect(() => {
+    const timers = toastTimers.current;
+    return () => timers.forEach((id) => clearTimeout(id));
+  }, []);
+
+  // Bumped each time a toast is clicked so OfficeGame re-opens that desk's chat.
+  const [chatRequest, setChatRequest] = useState<{ slug: EmployeeSlug; n: number } | null>(null);
+  const reqN = useRef(0);
+  const openToastChat = useCallback((slug: EmployeeSlug) => {
+    reqN.current += 1;
+    setChatRequest({ slug, n: reqN.current });
+    setToasts((cur) => cur.filter((x) => x.slug !== slug));
+  }, []);
+
+  const { active, recent, connected } = useJobStream({ onFinish: handleFinish });
 
   // Persist mode so refresh keeps the user in Office.
   useEffect(() => {
@@ -57,7 +94,7 @@ export default function OfficePage() {
     })();
   }, [router]);
 
-  // Map of active job per employee slug.
+  // Map of the job to surface per employee slug.
   const jobsBySlug = useMemo(() => {
     const m = new Map<string, ClientJob>();
     // Prefer the most recent running/queued job per employee.
@@ -67,8 +104,18 @@ export default function OfficePage() {
         m.set(j.employeeSlug, j);
       }
     }
+    // For employees with no live job, surface their most-recent finished job so
+    // OfficeGame can flash a brief "done ✅" bubble (it self-expires by
+    // finishedAt — an old job here just renders idle Zzz).
+    for (const j of recent) {
+      if (active.some((a) => a.employeeSlug === j.employeeSlug)) continue;
+      const existing = m.get(j.employeeSlug);
+      if (!existing || j.startedAt > existing.startedAt) {
+        m.set(j.employeeSlug, j);
+      }
+    }
     return m;
-  }, [active]);
+  }, [active, recent]);
 
   const workingNow = active.length;
   const totalAgents = EMPLOYEES.length;
@@ -171,8 +218,19 @@ export default function OfficePage() {
       </header>
 
       {/* OFFICE FLOOR */}
-      <div className="min-h-0 overflow-hidden">
-        <OfficeGame jobsBySlug={jobsBySlug} onOpenDirect={openDirect} />
+      <div className="relative min-h-0 overflow-hidden">
+        <OfficeGame
+          jobsBySlug={jobsBySlug}
+          onOpenDirect={openDirect}
+          openRequest={chatRequest}
+        />
+
+        {/* Side toast stack — "job done" pop-ups; click to open that desk's chat */}
+        <div className="absolute right-3 top-3 z-20 flex w-60 flex-col gap-2">
+          {toasts.map((t) => (
+            <ToastCard key={t.id} toast={t} onClick={() => openToastChat(t.slug)} />
+          ))}
+        </div>
       </div>
 
       {/* CONSOLE */}
@@ -213,6 +271,40 @@ function ModeSwitcher({
         Office
       </button>
     </div>
+  );
+}
+
+interface JobToast {
+  id: string;
+  slug: EmployeeSlug;
+  name: string;
+  accent?: string;
+  status: ClientJob["status"];
+}
+
+function ToastCard({ toast, onClick }: { toast: JobToast; onClick: () => void }) {
+  const ok = toast.status === "done";
+  const icon = ok ? "✅" : toast.status === "aborted" ? "🚫" : "⚠️";
+  const label = ok ? "ทำงานเสร็จแล้ว" : toast.status === "aborted" ? "ถูกยกเลิก" : "เกิดข้อผิดพลาด";
+  const accent = toast.accent || (ok ? "#34d399" : "#fb7185");
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="office-toast flex w-full items-center gap-2.5 border-2 border-border bg-surface/95 px-3 py-2 text-left shadow-[3px_3px_0_0_rgba(0,0,0,0.35)] backdrop-blur-sm transition hover:bg-surface-2 hover:shadow-[4px_4px_0_0_rgba(0,0,0,0.45)] active:translate-x-[1px] active:translate-y-[1px]"
+      style={{ borderLeftColor: accent, borderLeftWidth: 4 }}
+    >
+      <span className="text-base leading-none">{icon}</span>
+      <div className="min-w-0 flex-1">
+        <p className="truncate font-mono text-[11px] font-bold text-ink">
+          {truncate(toast.name, 22)}
+        </p>
+        <p className="font-mono text-[9px] uppercase tracking-wider text-ink-dim">
+          {label} · กดเปิดแชท
+        </p>
+      </div>
+      <span className="font-mono text-xs text-ink-dim">›</span>
+    </button>
   );
 }
 

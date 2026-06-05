@@ -8,6 +8,7 @@ import {
   getEmployee,
 } from "@/lib/employees";
 import { ClientJob } from "@/lib/useJobStream";
+import MiniChat from "./MiniChat";
 
 /* ================================================================== *
  *  OfficeGame — a walkable, top-down 8-bit office.
@@ -94,6 +95,36 @@ const BOARDS: Board[] = [
   { id: "hub", title: "Company Data", x: (WORLD_W - 320) / 2 - 80, y: 426, w: BOARD_W, h: BOARD_H, color: "#67e8f9" },
 ];
 
+/* ---- Decor props: non-interactive standing art that dresses the room ---
+ * Each prop loads /public/office/prop-<id>.png (transparent, drawn rising
+ * above its footprint like a board). The footprint doubles as a collision
+ * box so the player walks around it. Missing art falls back to a simple
+ * pixel pedestal so the floor never looks broken before the PNG lands.
+ * Placed in the open bottom band, clear of every desk + the customer-support
+ * seat (x720). */
+interface Prop {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string;
+  color: string;
+  // Optional animation: when the PNG is a cols×rows sprite sheet, cycle through
+  // its cells at `fps` so the prop looks alive (robot being built / part being
+  // printed). Omit (or 1×1) to treat the PNG as one static frame.
+  cols?: number;
+  rows?: number;
+  fps?: number;
+}
+const PROPS: Prop[] = [
+  // Big Borot mech being assembled by the team — parked to the RIGHT of the
+  // central "Company Data" hub board, baseline level with it (base ≈y552). The
+  // tall art tops out ≈y310 (just into the Creative Studio row above). PNG is a
+  // 2×2 sheet (4 frames) → welding sparks / gears loop at 4fps.
+  { id: "borot-build", x: 960, y: 432, w: 240, h: 120, label: "ASSEMBLY BAY", color: "#f6b53c", cols: 2, rows: 2, fps: 4 },
+];
+
 // Per-person seat lift (px). 0 = sit at the default desk line like everyone
 // else; Alex's portrait has extra headroom in its cell so it needs a nudge up
 // to clear the desk. Only deviate for individuals who look wrong.
@@ -124,11 +155,18 @@ const PLAYER_ROWS = 4;
 type Dir = "down" | "left" | "right" | "up";
 const DIR_ROW: Record<Dir, number> = { down: 0, left: 1, right: 2, up: 3 };
 
+/** How long (ms) to flash a "done ✅" bubble after a job finishes before the
+ *  employee falls back to idle Zzz. Self-expires by job.finishedAt each frame. */
+const DONE_BUBBLE_MS = 5000;
+
 /* ================================================================== */
 
 interface Props {
   jobsBySlug: Map<string, ClientJob>;
   onOpenDirect: (slug: EmployeeSlug) => void;
+  /** External request to pop open a desk's mini-chat (e.g. user clicked a
+   *  "job done" toast). Bumped nonce re-triggers even for the same slug. */
+  openRequest?: { slug: EmployeeSlug; n: number } | null;
 }
 
 interface SpriteImg {
@@ -194,7 +232,7 @@ function scanFootPadding(img: HTMLImageElement, cols: number, rows: number): num
   }
 }
 
-export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
+export default function OfficeGame({ jobsBySlug, onOpenDirect, openRequest }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Mutable game state in refs so the rAF loop never restarts.
@@ -215,13 +253,31 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
   const empSheets = useRef<Map<string, SpriteImg>>(new Map());
   const deskSheets = useRef<Map<string, SpriteImg>>(new Map());
   const boardSheets = useRef<Map<string, SpriteImg>>(new Map());
+  const propSheets = useRef<Map<string, SpriteImg>>(new Map());
+  // Per-prop, per-sheet-row empty bottom padding (like playerFootPad) so a prop
+  // whose art has transparent space under its base still sits on its shadow
+  // instead of floating above it.
+  const propFootPads = useRef<Map<string, number[]>>(new Map());
 
   const camRef = useRef({ x: 0, y: 0, scale: 1 });
   const nearRef = useRef<{ kind: "desk" | "board"; id: string } | null>(null);
+  // Monotonic frame counter driving the small idle/working employee animations.
+  const tickRef = useRef(0);
 
   // DOM overlay state (changes rarely).
   const [prompt, setPrompt] = useState<{ kind: "desk" | "board"; label: string } | null>(null);
   const [openBoard, setOpenBoard] = useState<Board | null>(null);
+  // Desk → in-game mini chat popup. Press E at a desk to open; replaces the old
+  // "navigate away to the dashboard" behaviour. onOpenDirect stays available as
+  // an explicit "open full chat" escape hatch from inside the popup.
+  const [openChat, setOpenChat] = useState<EmployeeSlug | null>(null);
+
+  // Open a desk's mini-chat on external request (toast click). Nonce in the
+  // dep means clicking the same agent's toast twice still re-opens it.
+  useEffect(() => {
+    if (openRequest?.slug) setOpenChat(openRequest.slug);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openRequest?.n]);
 
   /* ---- Load assets once ---- */
   useEffect(() => {
@@ -248,6 +304,19 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
           if (alive) boardSheets.current.set(b.id, s);
         });
       }
+      for (const pr of PROPS) {
+        // ?v bump = cache-bust so an edited PNG (e.g. re-keyed transparency)
+        // isn't served stale from the browser/Next static cache.
+        loadImg(`/office/prop-${pr.id}.png?v=9`).then((s) => {
+          if (!alive) return;
+          propSheets.current.set(pr.id, s);
+          if (s.ok)
+            propFootPads.current.set(
+              pr.id,
+              scanFootPadding(s.img, pr.cols || 1, pr.rows || 1),
+            );
+        });
+      }
     })();
     return () => {
       alive = false;
@@ -259,17 +328,20 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
     const near = nearRef.current;
     if (!near) return;
     if (near.kind === "desk") {
-      onOpenDirect(near.id as EmployeeSlug);
+      setOpenChat(near.id as EmployeeSlug);
     } else {
       const b = BOARDS.find((x) => x.id === near.id);
       if (b) setOpenBoard(b);
     }
-  }, [onOpenDirect]);
+  }, []);
 
   /* ---- Keyboard ---- */
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
+      // While the mini chat is open it owns the keyboard (typing, ESC). Don't
+      // let game movement/interact keys leak through underneath it.
+      if (openChat) return;
       if (["arrowup", "arrowdown", "arrowleft", "arrowright", " "].includes(k)) e.preventDefault();
       if (k === "e" || k === "enter" || k === " ") {
         if (openBoard) setOpenBoard(null);
@@ -287,7 +359,7 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
     };
-  }, [interact, openBoard]);
+  }, [interact, openBoard, openChat]);
 
   /* ---- Click-to-move ---- */
   const onCanvasClick = useCallback(
@@ -315,6 +387,7 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
     const SOLIDS = [
       ...DESKS.map((d) => ({ x: d.x, y: d.y, w: d.w, h: d.h })),
       ...BOARDS.map((b) => ({ x: b.x, y: b.y, w: b.w, h: b.h })),
+      ...PROPS.map((p) => ({ x: p.x, y: p.y, w: p.w, h: p.h })),
     ];
 
     const hits = (x: number, y: number) => {
@@ -415,6 +488,7 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
       camY = Math.max(0, Math.min(camY, WORLD_H - viewH / scale));
       camRef.current = { x: camX, y: camY, scale };
 
+      tickRef.current += 1;
       draw(ctx, cv, camX, camY, scale);
       raf = requestAnimationFrame(step);
     };
@@ -453,26 +527,68 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
     // the middle desks (y560).
     type Drawable =
       | { kind: "desk"; y: number; d: Desk }
-      | { kind: "board"; y: number; b: Board };
+      | { kind: "board"; y: number; b: Board }
+      | { kind: "prop"; y: number; p: Prop };
     const drawables: Drawable[] = [
       ...DESKS.map((d) => ({ kind: "desk" as const, y: d.y + d.h, d })),
       ...BOARDS.map((b) => ({ kind: "board" as const, y: b.y + b.h, b })),
+      ...PROPS.map((p) => ({ kind: "prop" as const, y: p.y + p.h, p })),
     ].sort((a, z) => a.y - z.y);
 
     for (const it of drawables) {
       if (it.kind === "board") {
         drawBoard(ctx, it.b, near?.kind === "board" && near.id === it.b.id);
+      } else if (it.kind === "prop") {
+        drawProp(ctx, it.p, tickRef.current);
       } else {
         const e = getEmployee(it.d.slug);
         if (!e) continue;
         const job = jobsRef.current.get(it.d.slug);
         const working = !!job && (job.status === "running" || job.status === "queued");
-        drawDesk(ctx, it.d, e, working, near?.kind === "desk" && near.id === it.d.slug);
-        if (working && job?.currentActivity) drawBubble(ctx, it.d, job.currentActivity);
+        drawDesk(ctx, it.d, e, working, near?.kind === "desk" && near.id === it.d.slug, tickRef.current);
       }
     }
 
     drawPlayer(ctx);
+
+    // --- Status overlay pass: drawn last so think/tool bubbles, floating
+    // status icons and idle Zzz never get covered by a desk in front. One
+    // indicator per employee derived from their live job:
+    //   running + activity → bubble (💭 thinking / ⚙️ tool / text) + floating icon
+    //   queued             → ⏳ floating icon
+    //   just finished      → ✅/⚠️ "done" bubble for DONE_BUBBLE_MS
+    //   idle (no job)      → faint Zzz
+    const now = Date.now();
+    for (const d of DESKS) {
+      const job = jobsRef.current.get(d.slug);
+      const status = job?.status;
+      const justDone =
+        (status === "done" || status === "error" || status === "aborted") &&
+        !!job?.finishedAt &&
+        now - job.finishedAt < DONE_BUBBLE_MS;
+      if (status === "running" || status === "queued") {
+        const queued = status === "queued";
+        const act = job?.currentActivity || "";
+        const thinking = !act || /กำลังคิด|thinking|คิด/i.test(act);
+        const icon = queued ? "⏳" : thinking ? "💭" : "⚙️";
+        // Always show a bubble while busy — fall back to a generic line when the
+        // job hasn't reported an activity yet (queued, or just started).
+        const text = act || (queued ? "เข้าคิวรอทำงาน…" : "กำลังคิด…");
+        drawBubble(ctx, d, text, icon);
+        drawStatusIcon(ctx, d, icon, tickRef.current);
+      } else if (justDone) {
+        // Brief acknowledgement that the agent finished thinking — otherwise the
+        // bubble just vanished and the user couldn't tell "done" from "stuck".
+        const ok = status === "done";
+        const icon = ok ? "✅" : status === "aborted" ? "🚫" : "⚠️";
+        const text = ok ? "เสร็จแล้ว" : status === "aborted" ? "ยกเลิกแล้ว" : "ผิดพลาด";
+        drawBubble(ctx, d, text, icon);
+        drawStatusIcon(ctx, d, icon, tickRef.current);
+      } else {
+        drawZzz(ctx, d, tickRef.current);
+      }
+    }
+
     ctx.restore();
   };
 
@@ -575,12 +691,85 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
     ctx.textAlign = "left";
   };
 
+  // Non-interactive decor prop. Draws the loaded art rising above its
+  // footprint (like a board); falls back to a simple pixel pedestal + crate so
+  // the spot reads as "something stands here" before the PNG lands. When the
+  // prop declares a cols×rows sheet, the current frame is cycled at `fps` so it
+  // animates (welding sparks, print head moving, etc).
+  const drawProp = (ctx: CanvasRenderingContext2D, p: Prop, tick: number) => {
+    const cx = p.x + p.w / 2;
+    // contact shadow
+    ctx.fillStyle = "rgba(0,0,0,0.24)";
+    ctx.beginPath();
+    ctx.ellipse(cx, p.y + p.h - 4, p.w / 2, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    const art = propSheets.current.get(p.id);
+    if (art?.ok) {
+      const cols = Math.max(1, p.cols || 1);
+      const rows = Math.max(1, p.rows || 1);
+      const fps = p.fps || 4;
+      const cw = art.img.naturalWidth / cols;
+      const ch = art.img.naturalHeight / rows;
+      const frames = cols * rows;
+      const f = frames > 1 ? Math.floor(tick / (60 / fps)) % frames : 0;
+      const sxp = (f % cols) * cw;
+      const syp = Math.floor(f / cols) * ch;
+      const dw = p.w + 28;
+      const dh = (ch / cw) * dw;
+      // Seat the art on the shadow: shift down by this row's empty bottom
+      // padding so the prop's base (not the cell edge) meets the footprint line.
+      const pad = (propFootPads.current.get(p.id)?.[Math.floor(f / cols)] || 0) * dh;
+      ctx.drawImage(art.img, sxp, syp, cw, ch, cx - dw / 2, p.y + p.h - dh + pad, dw, dh);
+    } else {
+      // Pixel pedestal fallback: dark base, accent crate, a small "Borot part".
+      ctx.fillStyle = "#1b2030";
+      ctx.fillRect(p.x, p.y + p.h - 26, p.w, 22);
+      ctx.fillStyle = "#11141f";
+      ctx.fillRect(p.x, p.y + p.h - 26, p.w, 4);
+      ctx.fillStyle = p.color + "33";
+      ctx.fillRect(p.x + 10, p.y + 12, p.w - 20, p.h - 36);
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(p.x + 10, p.y + 12, p.w - 20, p.h - 36);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(cx - 12, p.y + p.h - 52, 24, 24);
+      ctx.fillStyle = "#0b0d16";
+      ctx.fillRect(cx - 5, p.y + p.h - 44, 10, 10);
+    }
+
+    drawPropPlate(ctx, p);
+  };
+
+  // Small pixel plaque under a prop showing its label in its accent colour.
+  const drawPropPlate = (ctx: CanvasRenderingContext2D, p: Prop) => {
+    const cx = p.x + p.w / 2;
+    const top = p.y + p.h + 2;
+    ctx.font = "bold 9px monospace";
+    const w = Math.max(60, ctx.measureText(p.label).width + 16);
+    const h = 16;
+    const x = cx - w / 2;
+    ctx.fillStyle = "#0b0d16";
+    ctx.fillRect(x - 2, top - 2, w + 4, h + 4);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(x - 1, top - 1, w + 2, h + 2);
+    ctx.fillStyle = "rgba(10,12,22,0.92)";
+    ctx.fillRect(x, top, w, h);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(x, top, w, 2);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#f4f7ff";
+    ctx.fillText(p.label, cx, top + 11);
+    ctx.textAlign = "left";
+  };
+
   const drawDesk = (
     ctx: CanvasRenderingContext2D,
     d: Desk,
     e: EmployeeMeta,
     working: boolean,
     highlight: boolean,
+    tick: number,
   ) => {
     ctx.fillStyle = "rgba(0,0,0,0.25)";
     ctx.beginPath();
@@ -595,9 +784,28 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
     // individual people up when their portrait sits low in its cell (e.g. Alex,
     // whose sprite has extra headroom and otherwise sinks into the desk).
     const footY = d.y + d.h - 16 - (SEAT_LIFT[d.slug] || 0);
+
+    // --- Small procedural life: flip between the sheet's two poses so the art
+    // looks alive even though each pose is a single frame. No bob/float — just a
+    // frame swap. A per-slug phase offset keeps the room out of lockstep.
+    //   idle    → hold the idle pose (frame 0); calm, no twitching
+    //   working → ease between idle(0)↔typing(1) on a ~1.4s cycle. We weight the
+    //             dwell so it rests on "typing" most of the cycle and dips to
+    //             idle briefly — looks like hands working, not a hard 2-frame
+    //             strobe.
+    const phase = slugPhase(d.slug);
+    const t = tick / 60; // seconds-ish
+    let pose: number;
+    if (working) {
+      // 0..1 triangle wave, period ~1.4s; pose=typing unless near the low dip.
+      const cyc = ((t / 1.4 + phase) % 1 + 1) % 1;
+      pose = cyc < 0.18 ? 0 : 1; // brief glance to idle, mostly typing
+    } else {
+      pose = 0; // idle: still
+    }
+
     if (sheet?.ok) {
       const cols = 2;
-      const pose = working ? 1 : 0; // typing when working, else idle
       const cw = sheet.img.naturalWidth / cols;
       const ch = sheet.img.naturalHeight / 2;
       const px = (pose % cols) * cw;
@@ -711,18 +919,84 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
     }
   };
 
-  const drawBubble = (ctx: CanvasRenderingContext2D, d: Desk, text: string) => {
-    const t = text.length > 40 ? text.slice(0, 39) + "…" : text;
-    ctx.font = "10px monospace";
-    const w = Math.min(220, ctx.measureText(t).width + 16);
-    const x = d.x + d.w / 2 - w / 2;
-    const y = d.y - 98;
-    ctx.fillStyle = "rgba(8,10,18,0.92)";
-    ctx.fillRect(x, y, w, 26);
+  // Thought/activity bubble above a working employee. Bigger + clearer than the
+  // old thin strip: rounded dark card, accent top bar, an emoji tag for the kind
+  // of work (💭 think / ⚙️ tool / ⏳ queued), a little tail pointing down at the
+  // worker, and a soft shadow so it reads at office zoom.
+  const drawBubble = (
+    ctx: CanvasRenderingContext2D,
+    d: Desk,
+    text: string,
+    icon: string,
+  ) => {
+    const label = `${icon} ${text}`;
+    const t = label.length > 42 ? label.slice(0, 41) + "…" : label;
+    ctx.font = "bold 11px monospace";
+    const tw = ctx.measureText(t).width;
+    const w = Math.min(248, tw + 20);
+    const h = 28;
+    const cx = d.x + d.w / 2;
+    const x = cx - w / 2;
+    const y = d.y - 104;
+
+    // shadow
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    roundRect(ctx, x + 2, y + 3, w, h, 7);
+    ctx.fill();
+    // card
+    ctx.fillStyle = "rgba(10,12,22,0.95)";
+    roundRect(ctx, x, y, w, h, 7);
+    ctx.fill();
+    // accent top bar
     ctx.fillStyle = "#67e8f9";
-    ctx.fillRect(x, y, w, 3);
+    roundRect(ctx, x, y, w, 4, 2);
+    ctx.fill();
+    // tail
+    ctx.fillStyle = "rgba(10,12,22,0.95)";
+    ctx.beginPath();
+    ctx.moveTo(cx - 6, y + h - 1);
+    ctx.lineTo(cx + 6, y + h - 1);
+    ctx.lineTo(cx, y + h + 8);
+    ctx.closePath();
+    ctx.fill();
+    // text
     ctx.fillStyle = "#e8edf7";
-    ctx.fillText(t, x + 8, y + 17);
+    ctx.textAlign = "center";
+    ctx.fillText(t, cx, y + 20);
+    ctx.textAlign = "left";
+  };
+
+  // Small emoji that hovers + bobs just above the worker's head — visible even
+  // when the activity text is empty, so "who is busy" reads at a glance.
+  const drawStatusIcon = (
+    ctx: CanvasRenderingContext2D,
+    d: Desk,
+    icon: string,
+    tick: number,
+  ) => {
+    const bob = Math.sin(tick / 12 + slugPhase(d.slug)) * 3;
+    ctx.font = "18px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(icon, d.x + d.w / 2, d.y - 64 + bob);
+    ctx.textAlign = "left";
+  };
+
+  // Faint floating "Zzz" for an idle employee — drifts up + fades on a loop.
+  const drawZzz = (ctx: CanvasRenderingContext2D, d: Desk, tick: number) => {
+    const period = 150; // frames per Zzz cycle
+    const k = (tick + slugPhase(d.slug) * 24) % period;
+    const f = k / period; // 0..1
+    const rise = f * 18;
+    const alpha = 0.35 * (1 - f);
+    if (alpha <= 0.02) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = "#c7d2fe";
+    ctx.font = "bold 13px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("Zzz", d.x + d.w / 2 + 16, d.y - 58 - rise);
+    ctx.textAlign = "left";
+    ctx.restore();
   };
 
   const drawPlayer = (ctx: CanvasRenderingContext2D) => {
@@ -842,18 +1116,63 @@ export default function OfficeGame({ jobsBySlug, onOpenDirect }: Props) {
 
       <div className="pointer-events-none absolute left-3 top-3 select-none rounded border-2 border-border bg-bg/80 px-2.5 py-1.5 font-mono text-[10px] leading-relaxed text-ink-dim backdrop-blur-sm">
         <span className="text-ink">WASD / ลูกศร</span> เดิน · <span className="text-ink">คลิก</span> เดินไปจุด ·{" "}
-        <span className="text-ink">E</span> โต้ตอบ
+        <span className="text-ink">E</span> คุย/เปิดบอร์ด
       </div>
 
-      {prompt && !openBoard && (
+      {prompt && !openBoard && !openChat && (
         <div className="pointer-events-none absolute bottom-6 left-1/2 -translate-x-1/2 animate-pulse rounded border-2 border-yellow-400 bg-bg/90 px-3 py-1.5 font-mono text-xs font-bold text-yellow-300 shadow-lg backdrop-blur-sm">
           กด <span className="rounded bg-yellow-400 px-1 text-black">E</span> · {prompt.label}
         </div>
       )}
 
       {openBoard && <BoardPanel onClose={() => setOpenBoard(null)} />}
+
+      {openChat &&
+        (() => {
+          const emp = getEmployee(openChat);
+          if (!emp) return null;
+          return (
+            <MiniChat
+              key={openChat}
+              employee={emp}
+              onClose={() => setOpenChat(null)}
+              onOpenFull={() => {
+                setOpenChat(null);
+                onOpenDirect(openChat);
+              }}
+            />
+          );
+        })()}
     </div>
   );
+}
+
+/* Rounded-rect path helper (ctx.roundRect isn't on older Safari). Leaves the
+ * path on the context so the caller can fill()/stroke() it. */
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+/* Deterministic 0..2π phase offset from a slug so each employee's idle/working
+ * bob is out of sync with its neighbours (no robotic room-wide unison). */
+function slugPhase(slug: string): number {
+  let h = 0;
+  for (let i = 0; i < slug.length; i++) h = (h * 31 + slug.charCodeAt(i)) % 360;
+  return (h / 360) * Math.PI * 2;
 }
 
 /* ---- Accent hex (canvas can't read Tailwind tokens) -------------- */

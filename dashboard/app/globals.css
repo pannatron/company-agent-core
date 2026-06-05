@@ -271,4 +271,13 @@
     border-right: 6px solid transparent;
     border-top: 8px solid currentColor;
   }
+
+  /* Side "job done" toast — slides in from the right, game-menu style */
+  .office-toast {
+    animation: officeToastIn 0.28s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+  }
+  @keyframes officeToastIn {
+    0%   { opacity: 0; transform: translateX(28px) scale(0.96); }
+    100% { opacity: 1; transform: translateX(0) scale(1); }
+  }
 }

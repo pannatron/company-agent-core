@@ -26,10 +26,12 @@ export default function OfficeConsole({ active, recentFinishes }: Props) {
   const seenStartsRef = useRef<Set<string>>(new Set());
   const seenFinishesRef = useRef<Set<string>>(new Set());
 
-  // Track start events (running or queued jobs we haven't logged yet)
+  // Track start events (running or queued jobs we haven't logged yet).
+  // `active` is newest-first; iterate oldest-first so a batch appends in
+  // chronological order (newest line ends up at the bottom, chat-style).
   useEffect(() => {
     const newLines: ConsoleLine[] = [];
-    for (const job of active) {
+    for (const job of [...active].reverse()) {
       const key = `start:${job.id}`;
       if (seenStartsRef.current.has(key)) continue;
       if (job.status === "running") {
@@ -48,10 +50,11 @@ export default function OfficeConsole({ active, recentFinishes }: Props) {
     }
   }, [active]);
 
-  // Track finish events
+  // Track finish events. `recentFinishes` is newest-first; iterate oldest-first
+  // so finishes append chronologically (newest at the bottom).
   useEffect(() => {
     const newLines: ConsoleLine[] = [];
-    for (const job of recentFinishes) {
+    for (const job of [...recentFinishes].reverse()) {
       const key = `finish:${job.id}`;
       if (seenFinishesRef.current.has(key)) continue;
       seenFinishesRef.current.add(key);
@@ -138,7 +141,9 @@ export default function OfficeConsole({ active, recentFinishes }: Props) {
             <p className="text-ink-dim">— ทุกคนว่าง —</p>
           ) : (
             <ul className="space-y-1.5">
-              {active.map((j) => (
+              {/* `active` is newest-first; render oldest-first so the task you
+                  just started sits at the BOTTOM (chat-style), not the top. */}
+              {[...active].reverse().map((j) => (
                 <ActiveJobRow key={j.id} job={j} />
               ))}
             </ul>
